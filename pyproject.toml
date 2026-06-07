@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sheerscan"
+version = "0.1.0"
+description = "高召回的视频丝袜（薄透锦纶袜）识别 pipeline：VLM 粗筛 + 语义过滤 + 人工复核。"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ldy-mitbbs" }]
+keywords = ["video", "vlm", "detection", "hosiery", "ffmpeg", "ollama"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "requests",
+    "pillow",
+    "av",            # PyAV fallback for frame extraction
+]
+
+[project.urls]
+Homepage = "https://github.com/ldy-mitbbs/sheerscan"
+Repository = "https://github.com/ldy-mitbbs/sheerscan"
+
+[project.optional-dependencies]
+web = ["flask"]
+test = ["pytest"]
+# Opt-in crop-zoom pose localization (INSPECTOR_CROP_ZOOM): runs in a subprocess
+# to keep opencv's bundled libs out of the PyAV inspector process.
+cropzoom = ["ultralytics", "opencv-python", "numpy"]
+# Opt-in local CLIP pre-filter (INSPECTOR_LOCAL_CLIP_ENABLED, default off).
+clip = ["torch", "transformers"]
+
+[project.scripts]
+sheerscan = "sheerscan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sheerscan*"]
+
+[tool.setuptools.package-data]
+sheerscan = ["web/static/*.html"]

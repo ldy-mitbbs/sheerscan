@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+# local-only sensitive artifacts (frames, corpus, job traces)
+sheerscan-local/
+# auto-downloaded model weights (ultralytics YOLO etc.)
+*.pt
+*.pth
+*.onnx
+# corpus manifest stays local — contains explicit reason text (not for publish)
+tests/inspector_corpus/manifest.jsonl

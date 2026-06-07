@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>sheerscan - 丝袜识别回归语料</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  .pill { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; display: inline-block; }
+  .pill-pos { background: #dcfce7; color: #15803d; }
+  .pill-neg { background: #fee2e2; color: #dc2626; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+<div id="app" class="max-w-6xl mx-auto p-6 space-y-6">
+
+  <header class="flex items-center justify-between flex-wrap gap-3 border-b pb-4 border-slate-200">
+    <div>
+      <h1 class="text-2xl font-semibold">🧦 回归语料标注 (Regression Corpus)</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        人工标注的正/负样本构成回归基准。调优 pipeline 后用 <code class="px-1 bg-slate-100 rounded">sheerscan replay</code> 对比改进。
+      </p>
+    </div>
+    <div class="text-sm flex items-center gap-3">
+      <a href="/inspect" class="text-blue-700 hover:underline">AI 检测</a>
+      <a href="/drama" class="text-blue-700 hover:underline">剧集中心</a>
+    </div>
+  </header>
+
+  <section class="flex items-center justify-between flex-wrap gap-3">
+    <div class="flex items-center gap-4 text-sm">
+      <span>共 <b>{{ stats.total_examples || 0 }}</b> 例</span>
+      <span class="pill pill-pos">正 {{ stats.positives || 0 }}</span>
+      <span class="pill pill-neg">负 {{ stats.negatives || 0 }}</span>
+      <span class="text-slate-500">{{ stats.videos || 0 }} 个视频 · {{ stats.with_frames || 0 }} 有截图</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <select v-model="filter" class="border rounded px-2 py-1 text-sm">
+        <option value="">全部</option>
+        <option value="positive">仅正样本</option>
+        <option value="negative">仅负样本</option>
+      </select>
+      <button @click="harvest" :disabled="busy"
+              class="px-3 py-1.5 rounded bg-slate-800 text-white text-sm disabled:opacity-50">
+        {{ busy ? '收集中…' : '重新收集 (harvest)' }}
+      </button>
+    </div>
+  </section>
+
+  <p v-if="message" class="text-sm text-emerald-700">{{ message }}</p>
+
+  <section class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+    <div v-for="ex in examples" :key="ex.id"
+         class="border rounded-lg overflow-hidden bg-white shadow-sm"
+         :class="ex.label === 'negative' ? 'ring-1 ring-red-200' : 'ring-1 ring-emerald-200'">
+      <div class="aspect-video bg-slate-100 flex items-center justify-center">
+        <img v-if="ex.frame_url" :src="ex.frame_url" class="object-contain max-h-full" loading="lazy" />
+        <span v-else class="text-xs text-slate-400">无截图 ({{ ex.kind }})</span>
+      </div>
+      <div class="p-2 space-y-1">
+        <div class="flex items-center justify-between">
+          <span class="pill" :class="ex.label === 'negative' ? 'pill-neg' : 'pill-pos'">
+            {{ ex.label === 'negative' ? '负样本' : '正样本' }}
+          </span>
+          <span class="text-xs text-slate-400">{{ ex.timestamp }} · {{ ex.kind }}</span>
+        </div>
+        <p class="text-xs text-slate-600 line-clamp-3" :title="ex.reason">{{ ex.reason }}</p>
+        <div class="flex gap-1 pt-1">
+          <button @click="label(ex, 'positive')"
+                  class="flex-1 text-xs py-1 rounded border"
+                  :class="ex.label === 'positive' ? 'bg-emerald-600 text-white border-emerald-600' : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'">
+            ✓ 正
+          </button>
+          <button @click="label(ex, 'negative')"
+                  class="flex-1 text-xs py-1 rounded border"
+                  :class="ex.label === 'negative' ? 'bg-red-600 text-white border-red-600' : 'border-red-300 text-red-700 hover:bg-red-50'">
+            ✕ 负
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <p v-if="!examples.length" class="text-sm text-slate-500 text-center py-12">
+    暂无样本。先在 mpv 中标注镜头、或在 AI 检测页对结果反馈，然后点「重新收集」。
+  </p>
+</div>
+
+<script>
+const { createApp } = Vue;
+createApp({
+  data() { return { examples: [], stats: {}, filter: "", busy: false, message: "" }; },
+  watch: { filter() { this.load(); } },
+  mounted() { this.load(); },
+  methods: {
+    async load() {
+      const q = this.filter ? ("?label=" + this.filter) : "";
+      const r = await fetch("/api/corpus" + q);
+      const d = await r.json();
+      this.examples = d.examples || [];
+      this.stats = d.stats || {};
+    },
+    async harvest() {
+      this.busy = true; this.message = "";
+      try {
+        const r = await fetch("/api/corpus/harvest", { method: "POST" });
+        const d = await r.json();
+        const s = d.stats || {};
+        this.message = `已收集：${s.total_examples} 例（${s.marks} 标注 + ${s.feedback} 反馈），${s.frames_copied} 截图。`;
+        await this.load();
+      } finally { this.busy = false; }
+    },
+    async label(ex, label) {
+      const prev = ex.label;
+      ex.label = label;
+      const r = await fetch("/api/corpus/label", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: ex.id, label }),
+      });
+      if (!r.ok) { ex.label = prev; return; }
+      // refresh counts; drop from view if it no longer matches the filter
+      this.load();
+    },
+  },
+}).mount("#app");
+</script>
+</body>
+</html>

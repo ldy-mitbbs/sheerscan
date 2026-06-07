@@ -1,0 +1,1419 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>sheerscan - 丝袜 AI 检测</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .pill { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; display: inline-block; }
+  .pill-queued  { background: #fef3c7; color: #d97706; }
+  .pill-running { background: #dbeafe; color: #2563eb; }
+  .pill-completed { background: #dcfce7; color: #16a34a; }
+  .pill-failed  { background: #fee2e2; color: #dc2626; }
+  
+  .pill-conf-high { background: #dcfce7; color: #15803d; }
+  .pill-conf-medium { background: #fef3c7; color: #b45309; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+<div id="app" class="max-w-6xl mx-auto p-6 space-y-6">
+  
+  <!-- Header -->
+  <header class="flex items-center justify-between flex-wrap gap-3 border-b pb-4 border-slate-200">
+    <div>
+      <h1 class="text-2xl font-semibold flex items-center gap-2">
+        <span>🧦 丝袜 AI 视频检测</span>
+      </h1>
+      <p class="text-sm text-slate-500 mt-1">
+        通过 AI 视觉分析（{{ inspectorModelLabel(inspector.model) }}）与字幕关键字关联，自动扫描视频中的丝袜/裤袜特写镜头。
+      </p>
+    </div>
+    <div class="text-sm flex items-center gap-3">
+      <a href="/drama" class="text-blue-700 hover:underline">剧集中心</a>
+      <a href="/tracker" class="text-blue-700 hover:underline">种子站</a>
+      <a href="/qbit" class="text-blue-700 hover:underline">qBit 管理</a>
+      <a href="/transcode" class="text-blue-700 hover:underline">H.265 转码</a>
+      <a href="/jobs" class="text-blue-700 hover:underline">字幕任务</a>
+    </div>
+  </header>
+
+  <div v-if="activeResult && !showSetup" class="bg-white rounded-lg shadow-sm border border-slate-100 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+    <div class="min-w-0">
+      <div class="text-xs text-slate-500">当前审核</div>
+      <div class="font-medium text-slate-900 truncate max-w-3xl">{{ activeResult.video_file }}</div>
+    </div>
+    <div class="flex items-center gap-2 text-xs">
+      <button @click="showSetup = true" class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 px-3 py-1.5 rounded font-medium">
+        任务列表 / 新建
+      </button>
+      <button @click="fetchJobs" class="bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded font-medium">
+        刷新
+      </button>
+    </div>
+  </div>
+
+  <!-- Main section: Create Job and Queue -->
+  <div v-if="showSetup" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    
+    <!-- Left panel: Form and media select -->
+    <div class="bg-white rounded-lg shadow-sm p-5 border border-slate-100 space-y-4">
+      <h2 class="text-lg font-medium text-slate-900 border-b pb-2 border-slate-100">新建检测任务</h2>
+      
+      <div v-if="loadingMedia" class="text-sm text-slate-400 py-4 text-center">
+        正在读取视频列表...
+      </div>
+      <div v-else class="space-y-4">
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">选择视频</label>
+          <select v-model="selectedFile" class="block w-full border border-slate-200 rounded-md p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+            <option value="" disabled>-- 请选择一个视频文件 --</option>
+            <option v-for="video in mediaFiles" :key="video.container_path" :value="video.container_path">
+              [{{ video.size_human }}] {{ basename(video.name) }}
+            </option>
+          </select>
+        </div>
+        
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+            采样帧间隔 (秒)
+          </label>
+          <input type="number" v-model.number="interval" min="2" max="60" class="block w-full border border-slate-200 rounded-md p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          <p class="text-[11px] text-slate-400 mt-1">
+            默认按设置采样。1 小时视频会按间隔抽帧后交给当前视觉模型粗筛。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 border border-slate-100 rounded-md p-3 bg-slate-50/70">
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">粗检模型</label>
+            <select v-model="inspector.model" class="block w-full border border-slate-200 rounded-md p-2 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white mono">
+              <option v-for="m in inspector.model_options" :key="'coarse-' + m.id" :value="m.id">
+                {{ m.id }}
+              </option>
+            </select>
+            <p class="text-[11px] text-slate-500 mt-1">{{ inspectorModelNote(inspector.model) }}</p>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">精检模型</label>
+            <select v-model="inspector.fine_model" class="block w-full border border-slate-200 rounded-md p-2 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white mono">
+              <option v-for="m in inspector.model_options" :key="'fine-' + m.id" :value="m.id">
+                {{ m.id }}
+              </option>
+            </select>
+            <p class="text-[11px] text-slate-500 mt-1">{{ inspectorModelNote(inspector.fine_model) }}</p>
+          </div>
+          <div>
+            <div class="flex items-center justify-between gap-2 mb-2">
+              <label class="block text-xs font-semibold text-slate-500 uppercase tracking-wider">最终复核</label>
+              <label class="inline-flex items-center gap-1 text-[11px] text-slate-600">
+                <input type="checkbox" v-model="inspector.verify_enabled" class="rounded border-slate-300">
+                启用
+              </label>
+            </div>
+            <select v-model="inspector.verify_model" :disabled="!inspector.verify_enabled" class="block w-full border border-slate-200 rounded-md p-2 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white mono disabled:bg-slate-100">
+              <option v-for="m in inspector.model_options" :key="'verify-' + m.id" :value="m.id">
+                {{ m.id }}
+              </option>
+            </select>
+            <p class="text-[11px] text-slate-500 mt-1">{{ inspector.verify_enabled ? inspectorModelNote(inspector.verify_model) : '关闭时只使用粗检/精检结果' }}</p>
+          </div>
+          <div class="md:col-span-3 flex items-center justify-between gap-2">
+            <span class="text-[11px] text-slate-500">模型设置会保存为后续任务的默认值。</span>
+            <button @click="saveInspectorSettings" :disabled="savingInspector"
+                    class="text-xs bg-slate-800 hover:bg-slate-900 disabled:bg-slate-300 text-white px-3 py-1.5 rounded font-medium">
+              {{ savingInspector ? '保存中...' : '保存模型设置' }}
+            </button>
+          </div>
+        </div>
+
+        <button @click="submitJob" :disabled="!selectedFile || submitting"
+                class="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-medium py-2 px-4 rounded-md text-sm transition focus:outline-none flex items-center justify-center gap-2">
+          <svg v-if="submitting" class="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+          </svg>
+          {{ submitting ? '正在提交...' : '开始 AI 视频分析' }}
+        </button>
+      </div>
+    </div>
+
+    <!-- Right panel: Jobs queue -->
+    <div class="bg-white rounded-lg shadow-sm p-5 border border-slate-100 lg:col-span-2 space-y-4 flex flex-col">
+      <div class="flex items-center justify-between border-b pb-2 border-slate-100">
+        <h2 class="text-lg font-medium text-slate-900">任务列表 (队列)</h2>
+        <div class="flex items-center gap-2">
+          <button v-if="activeResult" @click="showSetup = false" class="text-xs bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 px-2 py-1 rounded">
+            收起
+          </button>
+          <button @click="fetchJobs" class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-2 py-1 rounded">
+            刷新队列
+          </button>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto flex-1 max-h-[520px] overflow-y-auto">
+        <table class="min-w-full text-sm divide-y divide-slate-100">
+          <thead>
+            <tr class="text-slate-500 text-left font-medium">
+              <th class="py-2 px-3">视频文件名</th>
+              <th class="py-2 px-3">间隔</th>
+              <th class="py-2 px-3">状态</th>
+              <th class="py-2 px-3">时间</th>
+              <th class="py-2 px-3 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            <tr v-if="jobs.length === 0">
+              <td colspan="5" class="py-8 text-center text-slate-400 text-sm">暂无分析任务</td>
+            </tr>
+            <tr v-for="job in jobs" :key="job.job_id" @click="job.status === 'completed' ? selectJob(job.job_id) : null"
+                :class="{'bg-blue-50/20 font-medium': selectedJobId === job.job_id, 'cursor-pointer hover:bg-slate-50': job.status === 'completed'}">
+              <td class="py-3 px-3 max-w-[200px] truncate" :title="basename(job.container_path)">
+                {{ basename(job.container_path) }}
+              </td>
+              <td class="py-3 px-3 mono text-xs">{{ job.interval }}s</td>
+              <td class="py-3 px-3 max-w-[320px]">
+                <span class="pill" :class="'pill-' + job.status">{{ formatStatus(job.status) }}</span>
+                <div v-if="job.status === 'running'" class="w-24 bg-slate-100 rounded-full h-1.5 mt-1 overflow-hidden">
+                  <div class="bg-blue-600 h-1.5 transition-all duration-300" :style="{width: job.progress + '%'}"></div>
+                </div>
+                <div v-if="job.status === 'running'" class="mt-1 text-[11px] text-slate-600 break-words">
+                  {{ job.message }}
+                </div>
+                <pre v-if="(job.status === 'running' || job.status === 'queued') && job.progress_tail && job.progress_tail.length"
+                     class="mt-2 text-[11px] mono bg-slate-50 border border-slate-200 rounded p-2 max-h-32 overflow-auto whitespace-pre-wrap">{{ job.progress_tail.slice(-8).join('\n') }}</pre>
+                <div v-if="job.status === 'failed'" class="mt-1 text-xs text-rose-700 leading-snug break-words">
+                  {{ shortError(job.error) }}
+                  <div v-if="job.error_info" class="mt-2 rounded border border-rose-200 bg-rose-50 p-2 text-rose-900">
+                    <div class="font-semibold">{{ job.error_info.summary }}</div>
+                    <div class="mt-1 text-rose-800">{{ job.error_info.why }}</div>
+                    <ul v-if="job.error_info.suggestions && job.error_info.suggestions.length" class="mt-1 list-disc pl-4 text-rose-800">
+                      <li v-for="s in job.error_info.suggestions" :key="s">{{ s }}</li>
+                    </ul>
+                    <button v-if="job.error_info.recommended_model"
+                            @click="applyRecommendedModels(job.error_info)"
+                            class="mt-2 text-xs bg-white hover:bg-rose-100 text-rose-700 border border-rose-200 px-2 py-1 rounded font-medium">
+                      切到推荐模型
+                    </button>
+                  </div>
+                </div>
+              </td>
+              <td class="py-3 px-3 text-xs text-slate-400">{{ fmtAgo(job.created_at) }}</td>
+              <td class="py-3 px-3 text-right">
+                <button v-if="job.status === 'completed'" @click.stop="selectJob(job.job_id)"
+                        class="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 px-2 py-1 rounded font-medium border border-emerald-200">
+                  查看结果
+                </button>
+                <button v-else-if="job.status === 'failed'" @click.stop="showJobError(job)"
+                        class="text-xs bg-rose-50 hover:bg-rose-100 text-rose-700 px-2 py-1 rounded font-medium border border-rose-200">
+                  查看错误
+                </button>
+                <span v-else class="text-xs text-slate-400">进行中...</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Results Section -->
+  <div v-if="activeResult" class="bg-white rounded-lg shadow-sm p-5 border border-slate-100 space-y-5">
+    <div class="flex items-start justify-between gap-4 border-b pb-3 border-slate-100">
+      <div class="min-w-0">
+        <h2 class="text-lg font-semibold text-slate-900 truncate">分析报告: {{ activeResult.video_file }}</h2>
+        <p class="text-xs text-slate-400 mt-0.5">
+          扫描间隔: {{ activeResult.interval }} 秒 · 
+          共检出 <span class="text-emerald-600 font-bold">{{ activeResult.visual_detections?.length || 0 }}</span> 处丝袜镜头 · 
+          字幕关联 <span class="text-indigo-600 font-bold">{{ activeResult.subtitle_matches?.length || 0 }}</span> 处
+        </p>
+        <p v-if="activeResult.local_prefilter" class="text-xs text-slate-500 mt-1">
+          本地预筛：{{ activeResult.local_prefilter.input_count || 0 }} 帧
+          <span v-if="activeResult.local_prefilter.after_dedupe_count !== undefined">→ 去重 {{ activeResult.local_prefilter.after_dedupe_count }}</span>
+          <span v-if="activeResult.local_prefilter.after_clip_count !== undefined">→ CLIP {{ activeResult.local_prefilter.after_clip_count }}</span>
+          <span v-if="activeResult.local_prefilter.clip_model"> · {{ activeResult.local_prefilter.clip_model }} / {{ activeResult.local_prefilter.clip_device }}</span>
+        </p>
+      </div>
+      
+      <!-- Tabs toggle -->
+      <div class="flex border rounded overflow-hidden text-sm bg-slate-50 shrink-0">
+        <button @click="activeTab = 'overview'" 
+                :class="['px-4 py-1.5 font-medium transition', activeTab === 'overview' ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-100']">
+          总览
+        </button>
+        <button @click="activeTab = 'visual'" 
+                :class="['px-4 py-1.5 font-medium transition', activeTab === 'visual' ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-100']">
+          📷 视觉检测 ({{ activeResult.visual_detections?.length || 0 }})
+        </button>
+        <button @click="activeTab = 'subtitle'" 
+                :class="['px-4 py-1.5 font-medium transition', activeTab === 'subtitle' ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-100']">
+          📝 字幕关联 ({{ activeResult.subtitle_matches?.length || 0 }})
+        </button>
+        <button @click="activeTab = 'manual'" 
+                :class="['px-4 py-1.5 font-medium transition', activeTab === 'manual' ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-100']">
+          👁 人工标记 ({{ activeResult.manual_marks?.length || 0 }})
+        </button>
+        <button @click="activeTab = 'trace'" 
+                :class="['px-4 py-1.5 font-medium transition', activeTab === 'trace' ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-100']">
+          🔎 AI过程 ({{ activeResult.inspection_trace?.length || 0 }})
+        </button>
+      </div>
+    </div>
+
+    <div v-if="activeTab === 'overview'" class="space-y-4">
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <div class="border border-slate-200 rounded-lg bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">AI 命中</div>
+          <div class="text-2xl font-semibold text-slate-900">{{ activeResult.visual_detections?.length || 0 }}</div>
+        </div>
+        <div class="border border-slate-200 rounded-lg bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">人工事件</div>
+          <div class="text-2xl font-semibold text-slate-900">{{ activeResult.eval?.positive_events ?? (activeResult.manual_marks?.length || 0) }}</div>
+          <div class="text-[11px] text-slate-400">{{ activeResult.manual_marks?.length || 0 }} 次按键</div>
+        </div>
+        <div class="border border-rose-200 rounded-lg bg-rose-50 p-3">
+          <div class="text-xs text-rose-700">疑似漏检</div>
+          <div class="text-2xl font-semibold text-rose-900">{{ activeResult.eval?.false_negatives ?? manualMissCount }}</div>
+        </div>
+        <div class="border border-slate-200 rounded-lg bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">AI 调用记录</div>
+          <div class="text-2xl font-semibold text-slate-900">{{ activeResult.inspection_trace?.length || 0 }}</div>
+        </div>
+        <div class="border border-slate-200 rounded-lg bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">字幕命中</div>
+          <div class="text-2xl font-semibold text-slate-900">{{ activeResult.subtitle_matches?.length || 0 }}</div>
+        </div>
+      </div>
+
+      <div class="border border-slate-200 rounded-lg overflow-hidden">
+        <div class="px-3 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div class="text-sm font-semibold text-slate-800">审核时间线</div>
+            <div class="text-xs text-slate-500">按视频时间排序；人工标记旁边会显示最近的 AI 命中</div>
+          </div>
+          <div class="flex border rounded overflow-hidden bg-white text-xs">
+            <button v-for="opt in timelineFilters" :key="opt.value"
+                    @click="timelineFilter = opt.value"
+                    :class="['px-3 py-1.5 font-medium', timelineFilter === opt.value ? 'bg-slate-800 text-white' : 'text-slate-600 hover:bg-slate-50']">
+              {{ opt.label }} ({{ timelineFilterCount(opt.value) }})
+            </button>
+          </div>
+        </div>
+        <div v-if="filteredReviewTimeline.length === 0" class="text-center py-12 text-slate-400 text-sm">
+          暂无 AI 命中或人工标记。
+        </div>
+        <div v-else class="divide-y divide-slate-100">
+          <div v-for="item in filteredReviewTimeline" :key="item.key"
+               :class="['p-3 grid grid-cols-[92px_180px_1fr] gap-3 items-start', item.is_miss ? 'bg-rose-50/60' : 'bg-white']">
+            <div class="space-y-2">
+              <div class="mono text-sm font-semibold text-slate-800">{{ formatSeconds(item.seconds) }}s</div>
+              <span class="pill" :class="item.is_miss ? 'pill-failed' : (item.type === 'manual' ? 'pill-conf-high' : (item.confidence === 'high' ? 'pill-conf-high' : 'pill-conf-medium'))">
+                {{ item.is_miss ? '疑似漏检' : (item.type === 'manual' ? '人工' : item.confidence) }}
+              </span>
+            </div>
+            <div>
+              <img v-if="item.image_url" :src="item.image_url" class="w-full aspect-video object-cover rounded border border-slate-200 bg-slate-900">
+              <div v-else class="w-full aspect-video rounded border border-slate-200 bg-slate-100 flex items-center justify-center text-xs text-slate-400">无图</div>
+            </div>
+            <div class="min-w-0 flex-1 space-y-2">
+              <div class="flex flex-wrap items-center gap-2">
+                <div class="text-sm font-medium text-slate-900">{{ item.title }}</div>
+                <div v-if="item.type === 'manual' && item.nearest_ai" class="text-xs text-slate-500">
+                  最近 AI：{{ formatSeconds(item.nearest_ai.seconds) }}s · 差 {{ Math.abs(item.nearest_ai.seconds - item.seconds).toFixed(1) }}s
+                </div>
+                <div v-else-if="item.type === 'manual'" class="text-xs text-rose-700">
+                  30 秒内没有 AI 命中
+                </div>
+              </div>
+              <div class="text-sm text-slate-700 break-words leading-relaxed">{{ item.reason || item.title }}</div>
+              <div v-if="item.nearest_ai" class="text-xs text-slate-500">
+                AI 判断：{{ item.nearest_ai.reason || '无说明' }}
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button @click="playVideoAt(activeResult.container_path, item.seconds)"
+                        class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded font-medium">
+                  ▶ 播放
+                </button>
+                <button v-if="item.nearest_ai" @click="playVideoAt(activeResult.container_path, item.nearest_ai.seconds)"
+                        class="text-xs bg-white hover:bg-slate-50 text-slate-700 px-3 py-1 rounded border border-slate-200">
+                  播放最近 AI
+                </button>
+                <button v-if="item.type === 'ai' || item.nearest_ai" @click="activeTab='trace'"
+                        class="text-xs bg-white hover:bg-slate-50 text-slate-700 px-3 py-1 rounded border border-slate-200">
+                  看 AI 过程
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 1: Visual Detections Gallery -->
+    <div v-if="activeTab === 'visual'">
+      <div v-if="!activeResult.visual_detections || activeResult.visual_detections.length === 0" class="text-center py-16 text-slate-400">
+        AI 未在此视频中识别出符合描述的丝袜/裤袜特写镜头。
+      </div>
+      
+      <div v-else class="space-y-4">
+        <!-- Controls row -->
+        <div class="flex items-center justify-between flex-wrap gap-3 bg-slate-50 p-3 rounded-lg border border-slate-200/60 text-xs">
+          <div class="flex items-center gap-3 flex-wrap">
+            <button @click="enterQuickReview"
+                    class="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded font-semibold flex items-center gap-1.5">
+              ⚡ 快速复核
+            </button>
+            <span class="text-slate-500">已复核 <b class="text-slate-800">{{ reviewedCount }}</b>/{{ activeResult.visual_detections?.length || 0 }}</span>
+            <label class="flex items-center gap-1.5 cursor-pointer text-slate-700 select-none font-medium">
+              <input type="checkbox" v-model="groupByScene" class="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4">
+              <span>按场景合并相邻帧</span>
+            </label>
+          </div>
+          <div class="flex items-center gap-3">
+            <button @click="harvestCorpus" :disabled="harvesting"
+                    class="bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 px-3 py-1.5 rounded font-medium disabled:opacity-50">
+              {{ harvesting ? '收集中…' : '📥 收集到回归语料' }}
+            </button>
+            <span v-if="corpusStats" class="text-slate-500">语料 正{{ corpusStats.positives }}/负{{ corpusStats.negatives }}</span>
+            <a href="/corpus" class="text-indigo-600 hover:underline">语料库 ↗</a>
+          </div>
+        </div>
+
+        <!-- Quick Review mode: one detection at a time, keyboard-driven -->
+        <div v-if="quickReview && quickList.length" class="border-2 border-indigo-200 rounded-xl bg-white overflow-hidden">
+          <div class="flex items-center justify-between px-4 py-2 bg-indigo-50 border-b border-indigo-100 text-sm">
+            <div class="flex items-center gap-3">
+              <span class="font-semibold text-indigo-900">快速复核</span>
+              <span class="text-slate-500">{{ quickPos + 1 }} / {{ quickList.length }}</span>
+              <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+                <input type="checkbox" v-model="quickUnreviewedOnly" class="rounded border-slate-300 w-3.5 h-3.5">
+                只看未复核
+              </label>
+            </div>
+            <div class="flex items-center gap-3 text-xs text-slate-500">
+              <span class="hidden sm:inline">快捷键：<b>F</b> 误报 · <b>J</b> 真实 · <b>K</b> 很喜欢 · <b>空格</b> 播放 · <b>←→</b> 切换 · <b>Esc</b> 退出</span>
+              <button @click="exitQuickReview" class="bg-white border border-slate-300 px-2 py-1 rounded hover:bg-slate-50">退出</button>
+            </div>
+          </div>
+          <div class="w-full bg-slate-100 h-1">
+            <div class="bg-indigo-500 h-1 transition-all" :style="{width: (reviewedCount / Math.max(1, activeResult.visual_detections.length) * 100) + '%'}"></div>
+          </div>
+          <div class="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-0">
+            <!-- Big frame -->
+            <div class="relative bg-black flex items-center justify-center min-h-[320px]">
+              <img :src="frameUrl(selectedJobId, activePreviewFile(quickCurrent))" class="max-h-[60vh] w-full object-contain" />
+              <div class="absolute bottom-3 left-3 bg-black/70 text-white text-sm px-2.5 py-1 rounded mono">{{ activePreviewTimestamp(quickCurrent) }}</div>
+              <span class="absolute top-3 right-3 pill shadow" :class="quickCurrent.confidence === 'high' ? 'pill-conf-high' : 'pill-conf-medium'">
+                {{ quickCurrent.confidence === 'high' ? '高置信度' : (quickCurrent.confidence === 'low' ? '低置信度' : '中置信度') }}
+              </span>
+              <span v-if="quickCurrent.feedback" class="absolute top-3 left-3 text-xs px-2 py-0.5 rounded font-semibold"
+                    :class="quickCurrent.feedback.label === 'false_positive' ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'">
+                已标：{{ feedbackText(quickCurrent.feedback.label) }}
+              </span>
+            </div>
+            <!-- Controls -->
+            <div class="p-4 flex flex-col gap-3">
+              <p class="text-sm text-slate-700 leading-relaxed flex-1 overflow-y-auto max-h-40">{{ quickCurrent.reason || '（无说明）' }}</p>
+              <div v-if="quickCurrent.crop_image_file" class="space-y-1">
+                <div class="grid grid-cols-2 items-start gap-1.5">
+                  <div class="relative">
+                    <img :src="frameUrl(selectedJobId, quickCurrent.image_file)" class="w-full rounded border border-slate-200 block" />
+                    <div v-if="quickCurrent.crop_box" class="absolute border-2 border-indigo-500 rounded-sm pointer-events-none" :style="cropBoxStyle(quickCurrent.crop_box)"></div>
+                    <span class="absolute bottom-0.5 left-0.5 bg-black/65 text-white text-[9px] px-1 rounded">原图 · 框=裁剪区</span>
+                  </div>
+                  <div class="relative">
+                    <img :src="frameUrl(selectedJobId, quickCurrent.crop_image_file)" class="w-full rounded border border-indigo-300 block bg-slate-900" />
+                    <span class="absolute bottom-0.5 left-0.5 bg-indigo-600/85 text-white text-[9px] px-1 rounded">🔍 放大<span v-if="quickCurrent.crop_score != null"> · {{ Math.round(quickCurrent.crop_score * 100) }}%</span></span>
+                  </div>
+                </div>
+                <div class="text-[11px] text-slate-500">{{ quickCurrent.crop_pose ? '✓ 姿态定位到腿/脚' : '粗裁（未定位到腿，截画面下半部）' }}</div>
+              </div>
+              <div v-if="getPreviewFrames(quickCurrent).length" class="grid grid-cols-4 gap-1">
+                <button v-for="fr in getPreviewFrames(quickCurrent)" :key="fr.image_file"
+                        @click="selectPreviewFrame(quickCurrent, fr)"
+                        :class="['relative aspect-video rounded overflow-hidden border', activePreviewFile(quickCurrent) === fr.image_file ? 'border-indigo-600 ring-1 ring-indigo-600' : 'border-slate-200']">
+                  <img :src="frameUrl(selectedJobId, fr.image_file)" class="w-full h-full object-cover" />
+                </button>
+              </div>
+              <button @click="playVideoAt(activeResult.container_path, activePreviewSeconds(quickCurrent))"
+                      class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-lg flex items-center justify-center gap-2 text-base">
+                ▶ 用 mpv 播放（空格）
+              </button>
+              <div class="grid grid-cols-3 gap-2">
+                <button @click="quickLabel('false_positive')"
+                        class="py-3 rounded-lg font-semibold border-2 border-rose-200 text-rose-700 hover:bg-rose-50">
+                  👎 误报<div class="text-[10px] font-normal">F</div>
+                </button>
+                <button @click="quickLabel('like')"
+                        class="py-3 rounded-lg font-semibold border-2 border-emerald-200 text-emerald-700 hover:bg-emerald-50">
+                  👍 真实<div class="text-[10px] font-normal">J</div>
+                </button>
+                <button @click="quickLabel('love')"
+                        class="py-3 rounded-lg font-semibold border-2 border-fuchsia-200 text-fuchsia-700 hover:bg-fuchsia-50">
+                  💖 很喜欢<div class="text-[10px] font-normal">K</div>
+                </button>
+              </div>
+              <div class="flex items-center justify-between text-xs text-slate-500">
+                <button @click="quickGo(-1)" class="px-3 py-1 rounded border border-slate-200 hover:bg-slate-50">← 上一个</button>
+                <button @click="quickLabel('unsure')" class="px-3 py-1 rounded border border-slate-200 hover:bg-slate-50">跳过 (不确定)</button>
+                <button @click="quickGo(1)" class="px-3 py-1 rounded border border-slate-200 hover:bg-slate-50">下一个 →</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div v-else-if="quickReview" class="text-center py-12 text-slate-400 border-2 border-indigo-100 rounded-xl">
+          {{ quickUnreviewedOnly ? '全部已复核 🎉 取消“只看未复核”可重新浏览。' : '没有可复核的检出。' }}
+          <div class="mt-3"><button @click="exitQuickReview" class="text-indigo-600 hover:underline">退出快速复核</button></div>
+        </div>
+
+        <!-- Render Grouped View -->
+        <template v-if="!quickReview">
+        <div v-if="groupByScene" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+          <div v-for="(group, gIdx) in groupedDetections" :key="group.id"
+               class="group border border-slate-200 hover:border-blue-400 rounded-lg overflow-hidden bg-white hover:shadow-md transition duration-200 flex flex-col">
+            
+            <!-- Active Frame Image Thumbnail -->
+            <div class="relative bg-slate-900 aspect-video overflow-hidden">
+              <img :src="frameUrl(selectedJobId, activePreviewFile(getActiveDetection(group)))" alt="Stocking shot keyframe" 
+                   class="w-full h-full object-cover group-hover:scale-105 transition duration-300" />
+              <div class="absolute bottom-2 left-2 bg-black/60 text-white text-xs px-2 py-0.5 rounded mono">
+                {{ activePreviewTimestamp(getActiveDetection(group)) }}
+              </div>
+              <div class="absolute top-2 right-2">
+                <span class="pill shadow-sm" :class="getActiveDetection(group).confidence === 'high' ? 'pill-conf-high' : 'pill-conf-medium'">
+                  {{ getActiveDetection(group).confidence === 'high' ? '高置信度' : '中置信度' }}
+                </span>
+              </div>
+              <!-- Scene Count Badge if multiple -->
+              <div v-if="group.detections.length > 1" class="absolute top-2 left-2 bg-blue-600 text-white text-[10px] font-semibold px-2 py-0.5 rounded shadow-sm">
+                {{ group.detections.length }} 帧关联
+              </div>
+            </div>
+
+            <!-- Description and actions -->
+            <div class="p-3 flex-1 flex flex-col justify-between space-y-3">
+              <p class="text-xs text-slate-600 leading-relaxed whitespace-normal break-words min-h-[50px]" :title="getActiveDetection(group).reason">
+                {{ getActiveDetection(group).reason }}
+              </p>
+
+              <div v-if="getActiveDetection(group).crop_image_file" class="space-y-1">
+                <div class="grid grid-cols-2 items-start gap-1">
+                  <div class="relative">
+                    <img :src="frameUrl(selectedJobId, getActiveDetection(group).image_file)" class="w-full rounded border border-slate-200 block" />
+                    <div v-if="getActiveDetection(group).crop_box" class="absolute border-2 border-indigo-500 rounded-sm pointer-events-none" :style="cropBoxStyle(getActiveDetection(group).crop_box)"></div>
+                    <span class="absolute bottom-0.5 left-0.5 bg-black/65 text-white text-[9px] px-1 rounded">原图 · 框=裁剪区</span>
+                  </div>
+                  <div class="relative">
+                    <img :src="frameUrl(selectedJobId, getActiveDetection(group).crop_image_file)" class="w-full rounded border border-indigo-300 block bg-slate-900" />
+                    <span class="absolute bottom-0.5 left-0.5 bg-indigo-600/85 text-white text-[9px] px-1 rounded">🔍 放大<span v-if="getActiveDetection(group).crop_score != null"> · {{ Math.round(getActiveDetection(group).crop_score * 100) }}%</span></span>
+                  </div>
+                </div>
+                <div class="text-[10px] text-slate-500">{{ getActiveDetection(group).crop_pose ? '✓ 姿态定位到腿/脚' : '粗裁（未定位到腿）' }}</div>
+              </div>
+
+              <div v-if="getPreviewFrames(getActiveDetection(group)).length" class="border-t pt-2 border-slate-100">
+                <div class="text-[10px] text-slate-400 mb-1.5 font-medium">候选片段预览:</div>
+                <div class="grid grid-cols-4 gap-1">
+                  <button v-for="fr in getPreviewFrames(getActiveDetection(group))" :key="fr.image_file"
+                          @click="selectPreviewFrame(getActiveDetection(group), fr)"
+                          :title="fr.timestamp"
+                          :class="['relative aspect-video rounded overflow-hidden border', activePreviewFile(getActiveDetection(group)) === fr.image_file ? 'border-blue-600 ring-1 ring-blue-600' : 'border-slate-200 hover:border-blue-400']">
+                    <img :src="frameUrl(selectedJobId, fr.image_file)" class="w-full h-full object-cover" />
+                    <span class="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-[9px] mono leading-4">{{ (fr.timestamp || '').replace(/^00:/, '') }}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="flex flex-wrap gap-1.5">
+                <button v-for="opt in feedbackOptions" :key="opt.label"
+                        @click="submitDetectionFeedback(getActiveDetection(group), opt.label)"
+                        :class="['text-[11px] px-2 py-0.5 rounded border transition', feedbackClass(getActiveDetection(group), opt.label)]">
+                  {{ opt.text }}
+                </button>
+              </div>
+              
+              <!-- Group Timeline Picker -->
+              <div v-if="group.detections.length > 1" class="border-t pt-2 border-slate-100">
+                <div class="text-[10px] text-slate-400 mb-1.5 font-medium">选择此场景内的不同时间截屏:</div>
+                <div class="flex flex-wrap gap-1 max-h-[70px] overflow-y-auto pr-1">
+                  <button v-for="(subDet, subIdx) in group.detections" :key="subIdx"
+                          @click="selectGroupFrame(group.id, subIdx)"
+                          :title="subDet.reason"
+                          :class="['text-[10px] px-1.5 py-0.5 rounded transition select-none mono', isFrameActive(group, subIdx) ? 'bg-blue-600 text-white font-medium shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200']">
+                    {{ (subDet.timestamp || '').replace(/^00:/, '') }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="flex items-center justify-between border-t pt-2 border-slate-100">
+                <span class="text-[11px] text-slate-400 mono">{{ formatSeconds(activePreviewSeconds(getActiveDetection(group))) }} 秒处</span>
+                <button @click="playVideoAt(activeResult.container_path, activePreviewSeconds(getActiveDetection(group)))"
+                        class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded font-medium flex items-center gap-1 transition">
+                  ▶ 播放
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Render Original Grid View -->
+        <div v-else class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+          <div v-for="(det, index) in activeResult.visual_detections" :key="index"
+               class="group border border-slate-200 hover:border-blue-400 rounded-lg overflow-hidden bg-white hover:shadow-md transition duration-200 flex flex-col">
+            
+            <!-- Frame Image Thumbnail -->
+            <div class="relative bg-slate-900 aspect-video overflow-hidden">
+              <img :src="frameUrl(selectedJobId, activePreviewFile(det))" alt="Stocking shot keyframe" 
+                   class="w-full h-full object-cover group-hover:scale-105 transition duration-300" />
+              <div class="absolute bottom-2 left-2 bg-black/60 text-white text-xs px-2 py-0.5 rounded mono">
+                {{ activePreviewTimestamp(det) }}
+              </div>
+              <div class="absolute top-2 right-2">
+                <span class="pill shadow-sm" :class="det.confidence === 'high' ? 'pill-conf-high' : 'pill-conf-medium'">
+                  {{ det.confidence === 'high' ? '高置信度' : '中置信度' }}
+                </span>
+              </div>
+            </div>
+
+            <!-- Description and actions -->
+            <div class="p-3 flex-1 flex flex-col justify-between space-y-3">
+              <p class="text-xs text-slate-600 leading-relaxed whitespace-normal break-words">
+                {{ det.reason }}
+              </p>
+              <div v-if="det.crop_image_file" class="space-y-1">
+                <div class="grid grid-cols-2 items-start gap-1">
+                  <div class="relative">
+                    <img :src="frameUrl(selectedJobId, det.image_file)" class="w-full rounded border border-slate-200 block" />
+                    <div v-if="det.crop_box" class="absolute border-2 border-indigo-500 rounded-sm pointer-events-none" :style="cropBoxStyle(det.crop_box)"></div>
+                    <span class="absolute bottom-0.5 left-0.5 bg-black/65 text-white text-[9px] px-1 rounded">原图 · 框=裁剪区</span>
+                  </div>
+                  <div class="relative">
+                    <img :src="frameUrl(selectedJobId, det.crop_image_file)" class="w-full rounded border border-indigo-300 block bg-slate-900" />
+                    <span class="absolute bottom-0.5 left-0.5 bg-indigo-600/85 text-white text-[9px] px-1 rounded">🔍 放大<span v-if="det.crop_score != null"> · {{ Math.round(det.crop_score * 100) }}%</span></span>
+                  </div>
+                </div>
+                <div class="text-[10px] text-slate-500">{{ det.crop_pose ? '✓ 姿态定位到腿/脚' : '粗裁（未定位到腿）' }}</div>
+              </div>
+              <div v-if="getPreviewFrames(det).length" class="border-t pt-2 border-slate-100">
+                <div class="text-[10px] text-slate-400 mb-1.5 font-medium">候选片段预览:</div>
+                <div class="grid grid-cols-4 gap-1">
+                  <button v-for="fr in getPreviewFrames(det)" :key="fr.image_file"
+                          @click="selectPreviewFrame(det, fr)"
+                          :title="fr.timestamp"
+                          :class="['relative aspect-video rounded overflow-hidden border', activePreviewFile(det) === fr.image_file ? 'border-blue-600 ring-1 ring-blue-600' : 'border-slate-200 hover:border-blue-400']">
+                    <img :src="frameUrl(selectedJobId, fr.image_file)" class="w-full h-full object-cover" />
+                    <span class="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-[9px] mono leading-4">{{ (fr.timestamp || '').replace(/^00:/, '') }}</span>
+                  </button>
+                </div>
+              </div>
+              <div class="flex flex-wrap gap-1.5">
+                <button v-for="opt in feedbackOptions" :key="opt.label"
+                        @click="submitDetectionFeedback({ ...det, _index: index }, opt.label)"
+                        :class="['text-[11px] px-2 py-0.5 rounded border transition', feedbackClass(det, opt.label)]">
+                  {{ opt.text }}
+                </button>
+              </div>
+              <div class="flex items-center justify-between border-t pt-2 border-slate-100">
+                <span class="text-[11px] text-slate-400 mono">{{ formatSeconds(activePreviewSeconds(det)) }} 秒处</span>
+                <button @click="playVideoAt(activeResult.container_path, activePreviewSeconds(det))"
+                        class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded font-medium flex items-center gap-1 transition">
+                  ▶ 播放
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- TAB 2: Subtitle Correlations -->
+    <div v-if="activeTab === 'subtitle'">
+      <div v-if="!activeResult.subtitle_matches || activeResult.subtitle_matches.length === 0" class="text-center py-16 text-slate-400">
+        字幕中未找到与丝袜、裤袜相关的关键词。
+      </div>
+      
+      <div v-else class="overflow-hidden border border-slate-200 rounded-lg">
+        <table class="min-w-full text-sm divide-y divide-slate-200">
+          <thead class="bg-slate-50 text-slate-600">
+            <tr class="text-left font-semibold">
+              <th class="py-3 px-4 w-28">时间戳</th>
+              <th class="py-3 px-4">匹配字幕内容</th>
+              <th class="py-3 px-4 w-24 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 bg-white">
+            <tr v-for="(match, index) in activeResult.subtitle_matches" :key="index" class="hover:bg-slate-50/50">
+              <td class="py-3 px-4 font-mono text-xs text-slate-600">{{ match.timestamp }}</td>
+              <td class="py-3 px-4 text-slate-700 whitespace-pre-wrap leading-relaxed" v-html="highlightKeywords(match.text)"></td>
+              <td class="py-3 px-4 text-right">
+                <button @click="playVideoAt(activeResult.container_path, match.seconds)"
+                        class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded font-medium transition inline-flex items-center gap-1">
+                  ▶ 播放
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div v-if="activeTab === 'trace'" class="space-y-4">
+      <div v-if="!activeResult.inspection_trace || activeResult.inspection_trace.length === 0" class="text-center py-16 text-slate-400">
+        没有保存 AI 调用过程。重新检测后会生成。
+      </div>
+      <div v-for="(ev, idx) in activeResult.inspection_trace" :key="idx" class="border border-slate-200 rounded-lg bg-slate-50 p-3 space-y-3">
+        <div class="flex flex-wrap items-center gap-2 text-xs">
+          <span class="font-semibold text-slate-800">{{ ev.stage }}</span>
+          <span class="mono text-slate-500">{{ ev.kind }}</span>
+          <span class="mono text-blue-700">{{ ev.model }}</span>
+          <span v-if="ev.start_seconds !== undefined" class="mono text-slate-500">{{ formatSeconds(ev.start_seconds) }} - {{ formatSeconds(ev.end_seconds) }}</span>
+        </div>
+        <video v-if="ev.clip_artifact" class="w-full max-w-xl rounded bg-black" controls :src="artifactUrl(selectedJobId, ev.clip_artifact)"></video>
+        <div v-if="ev.frames && ev.frames.length" class="flex gap-2 overflow-x-auto pb-1">
+          <a v-for="fr in ev.frames" :key="fr.artifact" :href="artifactUrl(selectedJobId, fr.artifact)" target="_blank" class="shrink-0 w-36">
+            <img :src="artifactUrl(selectedJobId, fr.artifact)" class="w-36 aspect-video object-cover rounded border border-slate-200 bg-white">
+            <div class="text-[10px] mono text-slate-500 mt-1 truncate">{{ fr.frame_id }} · {{ fr.timestamp }}</div>
+          </a>
+        </div>
+        <details class="text-xs">
+          <summary class="cursor-pointer text-slate-600 font-medium">查看 AI 返回 / 解析结果</summary>
+          <pre class="mt-2 mono text-[11px] bg-white border rounded p-2 max-h-72 overflow-auto whitespace-pre-wrap">{{ formatTracePayload(ev) }}</pre>
+        </details>
+      </div>
+    </div>
+
+    <div v-if="activeTab === 'manual'" class="space-y-4">
+      <div v-if="!activeResult.manual_marks || activeResult.manual_marks.length === 0" class="text-center py-16 text-slate-400">
+        还没有 mpv 人工标记。播放时按 h 可以截图并记录当前时间点。
+      </div>
+      <div v-else class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+        <div v-for="mark in activeResult.manual_marks" :key="mark.mark_id" class="border border-slate-200 rounded-lg overflow-hidden bg-white">
+          <img v-if="mark.screenshot_file" :src="manualMarkImageUrl(mark)" class="w-full aspect-video object-cover bg-slate-900">
+          <div v-else class="w-full aspect-video bg-slate-100 flex items-center justify-center text-slate-400 text-xs">无截图</div>
+          <div class="p-3 space-y-2">
+            <div class="flex items-center justify-between text-xs">
+              <span class="mono text-slate-700">{{ mark.timestamp || formatSeconds(mark.seconds) }}</span>
+              <span class="text-slate-400">{{ mark.source || 'manual' }}</span>
+            </div>
+            <button @click="playVideoAt(activeResult.container_path, mark.seconds)"
+                    class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded font-medium">
+              ▶ 播放此处
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="fixed bottom-6 right-6 px-4 py-2.5 rounded-lg shadow-lg text-sm bg-slate-800 text-white hidden z-50"></div>
+
+</div>
+
+<script>
+const { createApp } = Vue;
+
+createApp({
+  data() {
+    return {
+      mediaFiles: [],
+      jobs: [],
+      selectedFile: "",
+      interval: 5,
+      inspector: {
+        model: "",
+        fine_model: "",
+        verify_enabled: false,
+        verify_model: "openai/gpt-5",
+        recommended_model: "qwen3.6-flash",
+        recommended_fine_model: "qwen3.5-omni-flash",
+        recommended_verify_model: "qwen3.6-flash",
+        model_options: []
+      },
+      savingInspector: false,
+      submitting: false,
+      loadingMedia: true,
+      selectedJobId: null,
+      activeResult: null,
+      activeTab: "overview",
+      showSetup: true,
+      timelineFilter: "all",
+      pollInterval: null,
+      groupByScene: true,
+      quickReview: false,
+      quickIndex: 0,
+      quickUnreviewedOnly: true,
+      harvesting: false,
+      corpusStats: null,
+      activeGroupIndices: {},
+      activePreviewFrames: {},
+      timelineFilters: [
+        { value: "all", label: "全部" },
+        { value: "missed", label: "疑似漏检" },
+        { value: "manual", label: "人工" },
+        { value: "ai", label: "AI" },
+      ],
+      feedbackOptions: [
+        { label: 'false_positive', text: '误报' },
+        { label: 'ok', text: '一般' },
+        { label: 'like', text: '喜欢' },
+        { label: 'love', text: '很喜欢' },
+        { label: 'unsure', text: '不确定' },
+      ]
+    };
+  },
+  computed: {
+    reviewTimeline() {
+      if (!this.activeResult) {
+        return [];
+      }
+      const visual = this.activeResult.visual_detections || [];
+      const aiItems = visual.map((det, index) => ({
+        key: `ai_${index}_${det.seconds}`,
+        type: 'ai',
+        seconds: Number(det.seconds || 0),
+        confidence: det.confidence || 'medium',
+        title: 'AI 命中',
+        reason: det.reason || '',
+        image_url: det.image_file && this.selectedJobId ? this.frameUrl(this.selectedJobId, det.image_file) : '',
+        detection: det
+      }));
+
+      if (this.activeResult.eval && Array.isArray(this.activeResult.eval.cases)) {
+        const manualEventItems = this.activeResult.eval.cases.map((caseItem, index) => {
+          const seconds = Number(caseItem.seconds || caseItem.start_seconds || 0);
+          const matched = caseItem.matched_detection || null;
+          const markCount = (caseItem.mark_ids || []).length || 1;
+          const start = Number(caseItem.start_seconds ?? seconds);
+          const end = Number(caseItem.end_seconds ?? seconds);
+          const rangeText = Math.abs(end - start) > 0.5
+            ? `${this.formatSeconds(start)}-${this.formatSeconds(end)}s`
+            : `${this.formatSeconds(seconds)}s`;
+          return {
+            key: `case_${caseItem.case_id || index}_${seconds}`,
+            type: 'manual',
+            seconds,
+            confidence: 'high',
+            title: `人工事件 · ${rangeText}`,
+            reason: `${markCount} 次人工标记${caseItem.note ? ' · ' + caseItem.note : ''}`,
+            image_url: caseItem.screenshot_file ? this.manualMarkImageUrl(caseItem) : '',
+            mark: caseItem,
+            nearest_ai: matched,
+            is_miss: !caseItem.matched
+          };
+        });
+        return [...aiItems, ...manualEventItems].sort((a, b) => a.seconds - b.seconds);
+      }
+
+      const manualItems = (this.activeResult.manual_marks || []).map((mark, index) => {
+        const seconds = Number(mark.seconds || 0);
+        let nearestAi = null;
+        let nearestDelta = Infinity;
+        for (const det of visual) {
+          const detSeconds = Number(det.seconds || 0);
+          const delta = Math.abs(detSeconds - seconds);
+          if (delta < nearestDelta) {
+            nearestDelta = delta;
+            nearestAi = det;
+          }
+        }
+        return {
+          key: `manual_${mark.mark_id || index}_${seconds}`,
+          type: 'manual',
+          seconds,
+          confidence: 'high',
+          title: '人工标记',
+          reason: mark.note || mark.filename || mark.timestamp || '',
+          image_url: mark.screenshot_file ? this.manualMarkImageUrl(mark) : '',
+          mark,
+          nearest_ai: nearestDelta <= 30 ? nearestAi : null,
+          is_miss: nearestDelta > 30
+        };
+      });
+
+      return [...aiItems, ...manualItems].sort((a, b) => a.seconds - b.seconds);
+    },
+    filteredReviewTimeline() {
+      if (this.timelineFilter === 'manual') {
+        return this.reviewTimeline.filter(item => item.type === 'manual');
+      }
+      if (this.timelineFilter === 'ai') {
+        return this.reviewTimeline.filter(item => item.type === 'ai');
+      }
+      if (this.timelineFilter === 'missed') {
+        return this.reviewTimeline.filter(item => item.is_miss);
+      }
+      return this.reviewTimeline;
+    },
+    manualMissCount() {
+      return this.reviewTimeline.filter(item => item.is_miss).length;
+    },
+    reviewedCount() {
+      const dets = (this.activeResult && this.activeResult.visual_detections) || [];
+      return dets.filter(d => d.feedback && d.feedback.label).length;
+    },
+    quickList() {
+      // detections (with their real index) to step through in quick review
+      const dets = (this.activeResult && this.activeResult.visual_detections) || [];
+      const withIdx = dets.map((d, i) => ({ ...d, _index: i }));
+      if (this.quickUnreviewedOnly) {
+        return withIdx.filter(d => !(d.feedback && d.feedback.label));
+      }
+      return withIdx;
+    },
+    quickPos() {
+      if (!this.quickList.length) return 0;
+      return Math.min(this.quickIndex, this.quickList.length - 1);
+    },
+    quickCurrent() {
+      return this.quickList[this.quickPos] || {};
+    },
+    groupedDetections() {
+      if (!this.activeResult || !this.activeResult.visual_detections) {
+        return [];
+      }
+      const sorted = this.activeResult.visual_detections
+        .map((det, index) => ({ ...det, _index: index }))
+        .sort((a, b) => a.seconds - b.seconds);
+      const groups = [];
+      const threshold = 15; // 15 seconds threshold for same scene
+
+      for (const det of sorted) {
+        if (groups.length === 0) {
+          groups.push({
+            id: 'group_0',
+            detections: [det],
+            defaultIdx: 0
+          });
+        } else {
+          const currentGroup = groups[groups.length - 1];
+          const lastDet = currentGroup.detections[currentGroup.detections.length - 1];
+          if (det.seconds - lastDet.seconds <= threshold) {
+            currentGroup.detections.push(det);
+          } else {
+            groups.push({
+              id: 'group_' + groups.length,
+              detections: [det],
+              defaultIdx: 0
+            });
+          }
+        }
+      }
+
+      const confOrder = { high: 1, medium: 2, low: 3 };
+      for (const group of groups) {
+        let bestIdx = 0;
+        let bestConfVal = 99;
+        for (let i = 0; i < group.detections.length; i++) {
+          const conf = group.detections[i].confidence || 'low';
+          const val = confOrder[conf] || 99;
+          if (val < bestConfVal) {
+            bestConfVal = val;
+            bestIdx = i;
+          }
+        }
+        group.defaultIdx = bestIdx;
+      }
+
+      groups.sort((a, b) => {
+        const getGroupBestConf = (g) => {
+          let minVal = 99;
+          for (const d of g.detections) {
+            const val = confOrder[d.confidence || 'low'] || 99;
+            if (val < minVal) minVal = val;
+          }
+          return minVal;
+        };
+        const confA = getGroupBestConf(a);
+        const confB = getGroupBestConf(b);
+        if (confA !== confB) return confA - confB;
+        return a.detections[0].seconds - b.detections[0].seconds;
+      });
+
+      return groups;
+    }
+  },
+  mounted() {
+    this.fetchMediaFiles();
+    this.fetchJobs();
+    this.fetchSettings();
+    
+    // Deep link from the drama page: /inspect?job=<id>&quick=1
+    const params = new URLSearchParams(window.location.search);
+    const jobParam = params.get('job');
+    if (jobParam) {
+      this.selectedJobId = jobParam;  // pre-claim so fetchJobs won't auto-pick another
+      this.selectJob(jobParam).then(() => {
+        if (params.get('quick') === '1') this.enterQuickReview();
+      });
+    }
+
+    // Auto refresh queue every 4 seconds
+    this.pollInterval = setInterval(() => {
+      this.fetchJobs();
+    }, 4000);
+
+    this._keyHandler = (e) => this.onQuickKey(e);
+    window.addEventListener('keydown', this._keyHandler);
+  },
+  beforeUnmount() {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+    }
+    if (this._keyHandler) {
+      window.removeEventListener('keydown', this._keyHandler);
+    }
+  },
+  methods: {
+    async fetchSettings() {
+      try {
+        const res = await fetch('/api/settings').then(r => r.json());
+        if (res && res.inspector && res.inspector.interval) {
+          this.interval = res.inspector.interval;
+        }
+        if (res && res.inspector) {
+          const opts = res.inspector.model_options || [];
+          this.inspector.model_options = opts.length ? opts : this.defaultInspectorModels();
+          this.inspector.recommended_model = res.inspector.recommended_model || 'qwen3.6-flash';
+          this.inspector.recommended_fine_model = res.inspector.recommended_fine_model || 'qwen3.5-omni-flash';
+          this.inspector.recommended_verify_model = res.inspector.recommended_verify_model || 'qwen3.6-flash';
+          this.inspector.model = res.inspector.model || this.inspector.recommended_model;
+          this.inspector.fine_model = res.inspector.fine_model || this.inspector.recommended_fine_model;
+          this.inspector.verify_enabled = !!res.inspector.verify_enabled;
+          this.inspector.verify_model = res.inspector.verify_model || this.inspector.recommended_verify_model;
+        }
+      } catch (e) {
+        console.error("Failed to fetch settings:", e);
+        this.inspector.model_options = this.defaultInspectorModels();
+      }
+    },
+    defaultInspectorModels() {
+      return [
+        { id: 'qwen3.6-flash', label: 'MuleRouter Qwen3.6 Flash', note: 'MuleRouter 官方 Qwen ID；适合粗检' },
+        { id: 'qwen3.5-omni-flash', label: 'MuleRouter Qwen3.5 Omni Flash', note: '低成本多模态模型，支持图像/视频输入；适合召回测试' },
+        { id: 'qwen3.5-plus', label: 'MuleRouter Qwen3.5 Plus', note: 'MuleRouter 官方 Qwen ID；适合精检/人工窗口回归' },
+        { id: 'google/gemini-2.5-flash', label: 'Gemini 2.5 Flash', note: '准确率/速度/成本比较均衡，适合粗检' },
+        { id: 'google/gemini-2.5-pro', label: 'Gemini 2.5 Pro', note: '更强视觉判断，适合精检；成本较高但更准' },
+        { id: 'google/gemini-2.0-flash-lite-001', label: 'Gemini 2.0 Flash Lite', note: '稳定、便宜，适合大量粗扫但准确率较保守' },
+        { id: 'openai/gpt-4o-mini', label: 'GPT-4o mini', note: 'OpenAI 视觉模型，适合作为备选' },
+        { id: 'openai/gpt-5', label: 'GPT-5', note: '更强但更贵，适合最终复核疑难截图' },
+        { id: 'qwen/qwen3.6-flash', label: 'Qwen3.6 Flash', note: 'Qwen 低成本视觉/视频模型；当前实测可用，适合粗检' },
+        { id: 'qwen/qwen3.5-plus-20260420', label: 'Qwen3.5 Plus', note: 'Qwen 高质量视觉/视频模型，适合精检/人工窗口回归' },
+      ];
+    },
+    inspectorModelLabel(id) {
+      const m = this.inspector.model_options.find(x => x.id === id);
+      return m ? m.label : (id || '视觉模型');
+    },
+    inspectorModelNote(id) {
+      const m = this.inspector.model_options.find(x => x.id === id);
+      return m ? m.note : '可在设置中输入 OpenRouter 支持的视觉模型 ID。';
+    },
+    basename(path) {
+      return String(path || '').split('/').pop() || path;
+    },
+    formatSeconds(seconds) {
+      return Number(seconds).toFixed(1);
+    },
+    formatStatus(status) {
+      const labels = {
+        queued: '排队中',
+        running: '运行中',
+        completed: '已完成',
+        failed: '失败'
+      };
+      return labels[status] || status;
+    },
+    timelineFilterCount(value) {
+      if (value === 'manual') {
+        return this.reviewTimeline.filter(item => item.type === 'manual').length;
+      }
+      if (value === 'ai') {
+        return this.reviewTimeline.filter(item => item.type === 'ai').length;
+      }
+      if (value === 'missed') {
+        return this.manualMissCount;
+      }
+      return this.reviewTimeline.length;
+    },
+    shortError(error) {
+      const text = String(error || '检测失败');
+      return text.length > 220 ? text.slice(0, 220) + '...' : text;
+    },
+    fmtAgo(ts) {
+      if (!ts) return '';
+      const d = Math.round(Date.now() / 1000 - ts);
+      if (d < 60) return d + '秒前';
+      if (d < 3600) return Math.round(d / 60) + '分钟前';
+      return Math.round(d / 3600) + '小时前';
+    },
+    showToast(message, isError = false) {
+      const toast = document.getElementById("toast");
+      toast.innerText = message;
+      if (isError) {
+        toast.className = "fixed bottom-6 right-6 px-4 py-2.5 rounded-lg shadow-lg text-sm bg-rose-600 text-white z-50";
+      } else {
+        toast.className = "fixed bottom-6 right-6 px-4 py-2.5 rounded-lg shadow-lg text-sm bg-emerald-600 text-white z-50";
+      }
+      toast.classList.remove("hidden");
+      setTimeout(() => {
+        toast.classList.add("hidden");
+      }, 3000);
+    },
+    showJobError(job) {
+      if (job && job.error_info) {
+        const suggestions = (job.error_info.suggestions || []).join('；');
+        this.showToast(`${job.error_info.summary}：${job.error_info.why}${suggestions ? ' 建议：' + suggestions : ''}`, true);
+        return;
+      }
+      this.showToast((job && job.error) || '检测失败', true);
+    },
+    async saveInspectorSettings(silent = false) {
+      this.savingInspector = true;
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            inspector: {
+              model: this.inspector.model,
+              fine_model: this.inspector.fine_model,
+              verify_enabled: this.inspector.verify_enabled,
+              verify_model: this.inspector.verify_model,
+              interval: this.interval
+            }
+          })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || '保存失败');
+        if (!silent) this.showToast('模型设置已保存');
+      } catch (e) {
+        this.showToast('保存模型设置失败：' + e, true);
+        throw e;
+      } finally {
+        this.savingInspector = false;
+      }
+    },
+    async applyRecommendedModels(info) {
+      this.inspector.model = info.recommended_model || this.inspector.recommended_model;
+      this.inspector.fine_model = info.recommended_fine_model || this.inspector.recommended_fine_model;
+      await this.saveInspectorSettings();
+    },
+    async fetchMediaFiles() {
+      try {
+        const res = await fetch("/api/inspect/media_files");
+        if (res.ok) {
+          this.mediaFiles = await res.json();
+        } else {
+          this.showToast("加载可分析视频列表失败", true);
+        }
+      } catch (err) {
+        this.showToast("网络请求错误，无法获取视频列表", true);
+      } finally {
+        this.loadingMedia = false;
+      }
+    },
+    async fetchJobs() {
+      try {
+        const res = await fetch("/api/inspect/jobs");
+        if (res.ok) {
+          this.jobs = await res.json();
+
+          if (!this.selectedJobId && !this.activeResult) {
+            const latestCompleted = this.jobs.find(j => j.status === "completed");
+            if (latestCompleted) {
+              this.selectJob(latestCompleted.job_id);
+            }
+          }
+          
+          // If there's an active job result we are viewing, reload its status
+          if (this.selectedJobId) {
+            const activeJob = this.jobs.find(j => j.job_id === this.selectedJobId);
+            if (activeJob && activeJob.status === "completed" && (!this.activeResult || this.activeResult.job_id !== this.selectedJobId)) {
+              this.selectJob(this.selectedJobId);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to fetch jobs:", err);
+      }
+    },
+    async submitJob() {
+      if (!this.selectedFile) return;
+      this.submitting = true;
+      try {
+        await this.saveInspectorSettings(true);
+        const res = await fetch("/api/inspect/jobs", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            container_path: this.selectedFile,
+            interval: this.interval
+          })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          this.showToast("任务已加入队列开始分析");
+          this.selectedFile = "";
+          this.fetchJobs();
+        } else {
+          this.showToast(data.error || "创建任务失败", true);
+        }
+      } catch (err) {
+        this.showToast("提交任务网络异常", true);
+      } finally {
+        this.submitting = false;
+      }
+    },
+    async selectJob(jobId) {
+      try {
+        const res = await fetch(`/api/inspect/jobs/${jobId}`);
+        if (res.ok) {
+          const data = await res.json();
+          this.selectedJobId = jobId;
+          this.activeGroupIndices = {};
+          this.activePreviewFrames = {};
+          if (data.result && data.result.visual_detections) {
+            const order = { high: 1, medium: 2, low: 3 };
+            data.result.visual_detections.sort((a, b) => {
+              const confA = order[a.confidence] || 99;
+              const confB = order[b.confidence] || 99;
+              if (confA !== confB) return confA - confB;
+              return a.seconds - b.seconds;
+            });
+          }
+          this.activeResult = data.result;
+          // Put the job_id into activeResult so we can build image URLs
+          if (this.activeResult) {
+            this.activeResult.job_id = jobId;
+            this.activeTab = 'overview';
+            this.timelineFilter = this.manualMissCount > 0 ? 'missed' : 'all';
+            this.showSetup = false;
+          }
+        } else {
+          this.showToast("加载任务结果详情失败", true);
+        }
+      } catch (err) {
+        this.showToast("加载分析结果出错", true);
+      }
+    },
+    frameUrl(jobId, filename) {
+      return `/api/inspect/frame/${jobId}/${filename}`;
+    },
+    cropBoxStyle(box) {
+      if (!box || box.length < 4) return {};
+      const [x0, y0, x1, y1] = box;
+      return {
+        left: (x0 * 100) + '%',
+        top: (y0 * 100) + '%',
+        width: ((x1 - x0) * 100) + '%',
+        height: ((y1 - y0) * 100) + '%',
+      };
+    },
+    artifactUrl(jobId, filename) {
+      return `/api/inspect/artifact/${jobId}/${filename}`;
+    },
+    manualMarkImageUrl(mark) {
+      return `/api/inspect/manual-mark/screenshot/${mark.screenshot_file}`;
+    },
+    formatTracePayload(ev) {
+      return JSON.stringify({
+        raw_content: ev.raw_content,
+        parsed_detections: ev.parsed_detections,
+        previous_reason: ev.previous_reason,
+      }, null, 2);
+    },
+    async playVideoAt(containerPath, seconds) {
+      try {
+        this.showToast(`正在跳转播放于 ${seconds.toFixed(1)} 秒处...`);
+        const res = await fetch("/api/drama/play", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            path: containerPath,
+            start_time: Math.floor(seconds).toString()
+          })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          this.showToast(data.error || "启动播放器失败", true);
+        }
+      } catch (err) {
+        this.showToast("连接播放器API异常", true);
+      }
+    },
+    highlightKeywords(text) {
+      if (!text) return "";
+      const keywords = [
+        "ストッキング", "パンスト", "タイツ", "美脚", "レギンス", "シアー",
+        "丝袜", "裤袜", "连裤袜", "袜脚"
+      ];
+      let escapedText = text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      
+      keywords.forEach(kw => {
+        const regex = new RegExp(`(${kw})`, "gi");
+        escapedText = escapedText.replace(regex, `<mark class="bg-yellow-200 px-0.5 rounded text-slate-900 font-medium">$1</mark>`);
+      });
+      return escapedText;
+    },
+    getActiveDetection(group) {
+      const idx = this.activeGroupIndices[group.id] !== undefined 
+        ? this.activeGroupIndices[group.id] 
+        : group.defaultIdx;
+      return group.detections[idx] || group.detections[0];
+    },
+    detectionKey(det) {
+      if (!det) return "";
+      if (det._index !== undefined) return `idx_${det._index}`;
+      return `${det.frame_id || 'det'}_${Math.round((det.seconds || 0) * 10)}`;
+    },
+    getPreviewFrames(det) {
+      if (!det || !Array.isArray(det.preview_frames)) return [];
+      return det.preview_frames.filter(fr => fr && fr.image_file);
+    },
+    activePreview(det) {
+      const frames = this.getPreviewFrames(det);
+      const activeFile = this.activePreviewFrames[this.detectionKey(det)];
+      return frames.find(fr => fr.image_file === activeFile) || null;
+    },
+    activePreviewFile(det) {
+      const active = this.activePreview(det);
+      return (active && active.image_file) || (det && det.image_file) || "";
+    },
+    activePreviewTimestamp(det) {
+      const active = this.activePreview(det);
+      return (active && active.timestamp) || (det && det.timestamp) || "";
+    },
+    activePreviewSeconds(det) {
+      const active = this.activePreview(det);
+      const seconds = active && typeof active.seconds === "number" ? active.seconds : det && det.seconds;
+      return Number(seconds || 0);
+    },
+    selectPreviewFrame(det, frame) {
+      if (!det || !frame || !frame.image_file) return;
+      this.activePreviewFrames = { ...this.activePreviewFrames, [this.detectionKey(det)]: frame.image_file };
+    },
+    isFrameActive(group, subIdx) {
+      const activeIdx = this.activeGroupIndices[group.id] !== undefined 
+        ? this.activeGroupIndices[group.id] 
+        : group.defaultIdx;
+      return activeIdx === subIdx;
+    },
+    feedbackClass(det, label) {
+      const current = det && det.feedback && det.feedback.label;
+      if (current === label) {
+        if (label === 'false_positive') return 'bg-rose-600 border-rose-600 text-white';
+        if (label === 'love') return 'bg-fuchsia-600 border-fuchsia-600 text-white';
+        if (label === 'like') return 'bg-emerald-600 border-emerald-600 text-white';
+        if (label === 'ok') return 'bg-blue-600 border-blue-600 text-white';
+        return 'bg-slate-700 border-slate-700 text-white';
+      }
+      return 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50';
+    },
+    async submitDetectionFeedback(det, label) {
+      if (!this.selectedJobId || !this.activeResult || det._index === undefined) return;
+      try {
+        const res = await fetch(`/api/inspect/jobs/${this.selectedJobId}/feedback`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ detection_index: det._index, label })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || '保存反馈失败');
+        this.activeResult.visual_detections[det._index].feedback = data.feedback;
+        this.showToast('反馈已保存');
+      } catch (e) {
+        this.showToast(e.message || '保存反馈失败', true);
+      }
+    },
+    selectGroupFrame(groupId, index) {
+      this.activeGroupIndices = {
+        ...this.activeGroupIndices,
+        [groupId]: index
+      };
+    },
+    feedbackText(label) {
+      const m = { false_positive: '误报', ok: '一般', like: '真实', love: '很喜欢', unsure: '不确定' };
+      return m[label] || label;
+    },
+    enterQuickReview() {
+      if (!this.activeResult || !(this.activeResult.visual_detections || []).length) {
+        this.showToast('没有可复核的检出', true);
+        return;
+      }
+      this.quickReview = true;
+      this.quickIndex = 0;
+      this.activeTab = 'visual';
+    },
+    exitQuickReview() {
+      this.quickReview = false;
+    },
+    quickGo(delta) {
+      const n = this.quickList.length;
+      if (!n) return;
+      this.quickIndex = (this.quickPos + delta + n) % n;
+    },
+    async quickLabel(label) {
+      const det = this.quickCurrent;
+      if (det && det._index !== undefined) {
+        await this.submitDetectionFeedback(det, label);
+      }
+      // when filtering to unreviewed, the labeled item drops out; stay at the
+      // same position to land on the next pending one, else step forward.
+      if (this.quickUnreviewedOnly) {
+        if (this.quickIndex >= this.quickList.length) this.quickIndex = Math.max(0, this.quickList.length - 1);
+      } else {
+        this.quickGo(1);
+      }
+    },
+    onQuickKey(e) {
+      if (!this.quickReview || this.activeTab !== 'visual') return;
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const k = e.key.toLowerCase();
+      const map = {
+        'f': () => this.quickLabel('false_positive'),
+        'j': () => this.quickLabel('like'),
+        'k': () => this.quickLabel('love'),
+        's': () => this.quickLabel('unsure'),
+        ' ': () => this.playVideoAt(this.activeResult.container_path, this.activePreviewSeconds(this.quickCurrent)),
+        'arrowright': () => this.quickGo(1),
+        'arrowdown': () => this.quickGo(1),
+        'arrowleft': () => this.quickGo(-1),
+        'arrowup': () => this.quickGo(-1),
+        'escape': () => this.exitQuickReview(),
+      };
+      const fn = map[k];
+      if (fn) { e.preventDefault(); fn(); }
+    },
+    async harvestCorpus() {
+      this.harvesting = true;
+      try {
+        const res = await fetch('/api/corpus/harvest', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || '收集失败');
+        this.corpusStats = data.corpus;
+        const s = data.stats || {};
+        this.showToast(`已收集到回归语料：${s.total_examples} 例（正${data.corpus.positives}/负${data.corpus.negatives}）`);
+      } catch (e) {
+        this.showToast(e.message || '收集失败', true);
+      } finally {
+        this.harvesting = false;
+      }
+    }
+  }
+}).mount("#app");
+</script>
+</body>
+</html>
