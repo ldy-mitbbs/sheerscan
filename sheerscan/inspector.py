@@ -1097,11 +1097,18 @@ def post_openrouter_with_retry(url, headers, payload, timeout, attempts=3):
                 response.raise_for_status()
             except requests.exceptions.HTTPError as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status in retryable_status and attempt < attempts:
+                formatted = format_api_error(exc, provider_label)
+                # Quota exhaustion and provider content rejection are not
+                # transient — retrying just burns calls and backoff time.
+                deterministic = (
+                    is_quota_limit_error(formatted)
+                    or is_skippable_provider_content_error(formatted)
+                )
+                if status in retryable_status and attempt < attempts and not deterministic:
                     last_exc = exc
                     time.sleep(min(2 ** attempt, 8))
                     continue
-                raise RuntimeError(format_api_error(exc, provider_label)) from exc
+                raise RuntimeError(formatted) from exc
             return response
         except RuntimeError:
             raise
