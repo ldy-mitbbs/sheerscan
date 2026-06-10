@@ -185,6 +185,37 @@ def make_crop(video_path, seconds: float, out_path: Path, *, max_w: int = 1600,
     return {"used_pose": used_pose, "box": [round(v, 4) for v in box]}
 
 
+def second_chance_crop(video_path, seconds: float, image_path, out_path, *,
+                       max_w: int = 1600, min_w: int = 512) -> dict | None:
+    """Pose-gate + native-res leg crop for the second-chance recall pass.
+
+    Pose runs on the already-extracted coarse frame (``image_path``) so frames
+    without detectable legs cost no video decode at all; only on a pose hit is
+    the native frame extracted and the (scaled) leg box cropped from it.
+    Returns ``{"used_pose": True, "box": [...]}`` when a crop was saved,
+    ``{"skipped": "no_pose"}`` when no legs were localized, ``None`` on failure.
+    Calls pose detection (opencv) — run in the subprocess worker only."""
+    try:
+        with Image.open(image_path) as im:
+            res = pose_crop_region(im.convert("RGB"), min_w=min_w)
+    except Exception:
+        return None
+    if res is None:
+        return {"skipped": "no_pose"}
+    _, box = res
+    frame = extract_native_frame(video_path, seconds, max_w=max_w)
+    if frame is None:
+        return None
+    W, H = frame.size
+    crop = frame.crop((int(box[0] * W), int(box[1] * H), int(box[2] * W), int(box[3] * H)))
+    if crop.width < min_w:
+        crop = crop.resize((min_w, max(1, int(crop.height * min_w / crop.width))), Image.LANCZOS)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    crop.save(out_path, "JPEG", quality=92)
+    return {"used_pose": True, "box": [round(v, 4) for v in box]}
+
+
 def make_crop_heuristic(video_path, seconds: float, out_path: Path, *, max_w: int = 1600) -> dict | None:
     """Opencv-free crop (no pose): extract + fixed lower-frame region. Safe to
     call in the serve process; used as the fallback when the pose subprocess is
@@ -215,7 +246,9 @@ def make_crops_via_subprocess(video_path, items: list[dict], *, max_w: int = 160
         spec_path.write_text(json.dumps({
             "video_path": str(video_path), "max_w": max_w, "min_w": min_w,
             "result_path": str(result_path),
-            "items": [{"seconds": float(i["seconds"]), "out_path": str(i["out_path"])} for i in items],
+            "items": [{"seconds": float(i["seconds"]), "out_path": str(i["out_path"]),
+                       **({"image_path": str(i["image_path"])} if i.get("image_path") else {})}
+                      for i in items],
         }), encoding="utf-8")
         try:
             proc = subprocess.run(

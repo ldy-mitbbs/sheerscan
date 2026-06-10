@@ -14,6 +14,10 @@ Spec JSON::
     {"video_path": "...", "max_w": 1600, "min_w": 512, "result_path": "...",
      "items": [{"seconds": 12.5, "out_path": "/job/det_001_crop.jpg"}, ...]}
 
+An item may also carry ``"image_path"`` (an already-extracted frame): then the
+pose gate runs on that image first and the native frame is decoded only on a
+pose hit (the second-chance recall pass) — misses return ``{"skipped": "no_pose"}``.
+
 Result JSON: a list parallel to ``items``, each ``{"used_pose": bool}`` if the
 crop was saved, or ``null`` if that item failed.
 """
@@ -37,8 +41,12 @@ def main(argv: list[str]) -> int:
     results = []
     for it in spec.get("items", []):
         try:
-            info = crop_zoom.make_crop(video, float(it["seconds"]), Path(it["out_path"]),
-                                       max_w=max_w, min_w=min_w)
+            if it.get("image_path"):
+                info = crop_zoom.second_chance_crop(video, float(it["seconds"]), it["image_path"],
+                                                    Path(it["out_path"]), max_w=max_w, min_w=min_w)
+            else:
+                info = crop_zoom.make_crop(video, float(it["seconds"]), Path(it["out_path"]),
+                                           max_w=max_w, min_w=min_w)
         except Exception as e:  # never let one bad item abort the batch
             print(f"crop_zoom_worker: item {it.get('seconds')}s failed: {e}", file=sys.stderr)
             info = None

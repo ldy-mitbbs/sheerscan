@@ -37,7 +37,7 @@ from .inspector import (
     evaluate_against_corpus,
 )
 
-COARSE_STAGES = {"coarse_screenshot", "screenshot_coarse"}
+COARSE_STAGES = {"coarse_screenshot", "screenshot_coarse", "second_chance_crop"}
 SCREENSHOT_FINE_STAGES = {"screenshot_fine"}
 VIDEO_FINE_STAGES = {"fine_video"}
 
@@ -56,10 +56,24 @@ def replay_config(overrides: Optional[dict] = None) -> dict:
         "scene_support_window": get_float_setting("INSPECTOR_SCENE_SUPPORT_WINDOW_SECONDS", 10.0, min_value=1.0, max_value=120.0),
         "skip_fine": is_truthy_setting(get_setting("INSPECTOR_SKIP_FINE_PASS", "0")),
         "drop_weak_coarse": is_truthy_setting(get_setting("INSPECTOR_DROP_WEAK_COARSE", "0")),
+        # The two live stages after finalize_detections, so Tier A measures the
+        # pipeline the user actually runs (not just the keep filters):
+        "reason_filter": is_truthy_setting(get_setting("INSPECTOR_REASON_FILTER", "0")),
+        "crop_gate": _crop_gate_setting(),
     }
     if overrides:
         cfg.update(overrides)
     return cfg
+
+
+def _crop_gate_setting() -> Optional[float]:
+    raw = str(get_setting("INSPECTOR_CROP_ZOOM_DROP_BELOW", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def _coarse_fallback(coarse: list[dict]) -> list[dict]:
@@ -94,7 +108,7 @@ def replay_trace_postprocess(trace: list[dict], cfg: dict) -> list[dict]:
         frames_by_id = {f.get("frame_id"): f for f in (entry.get("frames") or [])}
 
         if stage in COARSE_STAGES:
-            hybrid = stage == "coarse_screenshot"
+            hybrid = stage in ("coarse_screenshot", "second_chance_crop")
             for det in parsed:
                 if not isinstance(det, dict):
                     continue
@@ -176,7 +190,7 @@ def replay_trace_postprocess(trace: list[dict], cfg: dict) -> list[dict]:
 # ---------------------------------------------------------------- job discovery
 
 def _iter_job_traces():
-    """Yield (job_id, container_path, trace) for every job with a trace.json."""
+    """Yield (job_id, container_path, trace, job_dir) for every job with a trace.json."""
     root = get_local_video_dir() / "inspections"
     if not root.exists():
         return
@@ -204,7 +218,44 @@ def _iter_job_traces():
                     container_path = json.loads(status_path.read_text(encoding="utf-8")).get("container_path")
                 except (OSError, json.JSONDecodeError):
                     pass
-        yield job_dir.name, container_path, trace
+        yield job_dir.name, container_path, trace, job_dir
+
+
+def _result_detections(job_dir: Path) -> list[dict]:
+    try:
+        data = json.loads((job_dir / "result.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [d for d in (data.get("visual_detections") or []) if isinstance(d, dict)]
+
+
+def attach_stored_crop_scores(detections: list[dict], stored: list[dict], *, window: float = 3.0) -> list[dict]:
+    """Copy the live run's crop-zoom re-scores onto replayed detections.
+
+    Tier A cannot recompute crops (needs frames + API), but the live job already
+    saved ``crop_score`` per detection in result.json. Joining by nearest seconds
+    (within ``window``, the dedupe width) lets the crop gate be swept offline.
+    """
+    scored = [(float(s["seconds"]), s) for s in stored
+              if s.get("seconds") is not None and s.get("crop_score") is not None]
+    if not scored:
+        return detections
+    for det in detections:
+        sec = det.get("seconds")
+        if sec is None or det.get("crop_score") is not None:
+            continue
+        dist, src = min(((abs(float(sec) - s0), s) for s0, s in scored), key=lambda t: t[0])
+        if dist <= window:
+            det["crop_score"] = src.get("crop_score")
+            if src.get("crop_pose") is not None:
+                det["crop_pose"] = src.get("crop_pose")
+    return detections
+
+
+def apply_crop_gate(detections: list[dict], gate: float) -> list[dict]:
+    """Drop detections whose crop re-score falls below ``gate`` (no score = keep)."""
+    return [d for d in detections
+            if not (d.get("crop_score") is not None and float(d["crop_score"]) < gate)]
 
 
 def replay_postprocess_over_corpus(*, overrides: Optional[dict] = None,
@@ -214,6 +265,13 @@ def replay_postprocess_over_corpus(*, overrides: Optional[dict] = None,
 
     When several jobs cover the same video the one yielding the most detections
     wins (the most complete run), so a partial/aborted re-run can't shadow a good one.
+
+    Mirrors the full live pipeline: after reconstructing + finalizing detections it
+    applies the semantic reason filter (when INSPECTOR_REASON_FILTER / the
+    ``reason_filter`` override is on; verdicts cached, fail-open) and the crop-zoom
+    gate (when ``crop_gate`` is set, reusing the live run's stored ``crop_score``).
+    Corpus videos with no trace at all are reported as ``uncovered_videos`` and
+    excluded from scoring — they measure harness coverage, not pipeline quality.
     """
     cfg = replay_config(overrides)
     by_video = corpus.corpus_by_video()
@@ -221,7 +279,8 @@ def replay_postprocess_over_corpus(*, overrides: Optional[dict] = None,
 
     detections_by_video: dict[str, list[dict]] = {}
     jobs_used: dict[str, str] = {}
-    for job_id, container_path, trace in _iter_job_traces():
+    job_dirs: dict[str, Path] = {}
+    for job_id, container_path, trace, job_dir in _iter_job_traces():
         vid = cp_to_vid.get(container_path)
         if not vid:
             continue
@@ -229,14 +288,47 @@ def replay_postprocess_over_corpus(*, overrides: Optional[dict] = None,
         if len(dets) >= len(detections_by_video.get(vid, [])):
             detections_by_video[vid] = dets
             jobs_used[vid] = job_id
+            job_dirs[vid] = job_dir
 
+    # Stored crop re-scores from the winning job (free to reuse offline).
+    for vid, dets in detections_by_video.items():
+        attach_stored_crop_scores(dets, _result_detections(job_dirs[vid]),
+                                  window=float(cfg.get("dedup_window") or 3.0))
+
+    reason_filter_stats = None
+    if cfg.get("reason_filter"):
+        from .reason_filter import filter_detections_by_reason
+        from .cache import Cache, default_cache_path
+        rf_cache = Cache(default_cache_path())
+        try:
+            totals = {"input": 0, "kept": 0, "dropped": 0}
+            available = True
+            for vid in list(detections_by_video):
+                kept, stats = filter_detections_by_reason(detections_by_video[vid], cache=rf_cache)
+                detections_by_video[vid] = kept
+                available = available and bool(stats.get("available"))
+                for k in totals:
+                    totals[k] += stats.get(k, 0) or 0
+            reason_filter_stats = {"available": available, **totals}
+        finally:
+            rf_cache.close()
+
+    if cfg.get("crop_gate") is not None:
+        gate = float(cfg["crop_gate"])
+        for vid in list(detections_by_video):
+            detections_by_video[vid] = apply_crop_gate(detections_by_video[vid], gate)
+
+    covered = {vid: bucket for vid, bucket in by_video.items() if vid in detections_by_video}
     metrics = evaluate_against_corpus(
-        detections_by_video, by_video,
+        detections_by_video, covered,
         tolerance_seconds=tolerance_seconds, merge_window_seconds=merge_window_seconds,
     )
     metrics["mode"] = "postprocess"
     metrics["config"] = cfg
     metrics["jobs_used"] = jobs_used
+    metrics["reason_filter"] = reason_filter_stats
+    metrics["corpus_videos_total"] = len(by_video)
+    metrics["uncovered_videos"] = sorted(set(by_video) - set(covered))
     return metrics
 
 

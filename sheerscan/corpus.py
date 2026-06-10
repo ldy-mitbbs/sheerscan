@@ -223,6 +223,11 @@ def harvest(*, verbose: bool = False) -> dict:
             # keep a stored frame hash if the fresh source lacks one
             if not row.get("frame_sha256") and existing.get("frame_sha256"):
                 row["frame_sha256"] = existing["frame_sha256"]
+            # a human correction (set_label) outranks the original mark/feedback —
+            # never let a re-harvest silently revert it
+            if existing.get("source") == "manual_label":
+                row["label"] = existing.get("label", row["label"])
+                row["source"] = "manual_label"
         rows[row["id"]] = row
 
     # 1) mpv manual marks -> positive/negative "event" examples

@@ -22,7 +22,8 @@
 1. **只做粗筛（coarse-only）**。加上"精筛视频复核"那一道**同时拉低了召回和精度**（它只处理一小部分候选，还确认错了对象）。单独粗筛召回好得多。
 2. **简单粗筛 prompt**。老的 ~600 字嵌套规则 prompt 容易"刷屏"误报；简单 prompt 直接点名明显的非目标。
 3. **不做置信度门控**。VLM 的 high/medium/low 不是校准过的统计量，在本类任务上反相关（见上）。所以粗筛 prompt 干脆不再要求给置信度，唯一判断就是二元的"有没有丝袜"。
-4. **语义 reason 过滤是唯一裁判**（`reason_filter.py`）。一个**本地**小模型（Ollama，默认 `qwen2.5:3b`）逐条读候选的中文 `reason` 描述，只丢掉它判定为明确"无丝袜"的（长裤盖住、明显凉鞋裸脚、清楚裸足、广告图/家具等），保留"有"和"不确定"。这取代了脆弱的关键词匹配 —— 让模型读懂**语义**，比关键词和置信度都稳。Ollama 不可用时**fail-open**（全保留，绝不静默丢弃）。
+4. **二次机会裁剪召回**（`INSPECTOR_SECOND_CHANCE=1`，默认开）。粗筛稳定漏掉"腿脚区域只占画面一小块"的场景——全帧提分辨率救不回来（实测纯波动），姿态定位的原生分辨率裁剪可以。对粗筛没报的采样帧：先在已抽出的帧上本地跑姿态检测（零解码、零 API），找到腿部的才解码原生帧、裁剪腿部、再问同一个粗筛模型一次。实测恢复 ~46% 的漏检事件，干净负样本区域只多 ~8% 误火。幸存者并入粗筛候选池，走同样的去重+语义过滤。`INSPECTOR_SECOND_CHANCE_MAX_CROPS`（默认 400）封顶成本。需要 `[cropzoom]` extra；姿态 worker 不可用时自动跳过（fail-open 回到纯粗筛）。
+5. **语义 reason 过滤是唯一裁判**（`reason_filter.py`）。一个**本地**小模型（Ollama，默认 `qwen2.5:3b`）逐条读候选的中文 `reason` 描述，只丢掉它判定为明确"无丝袜"的（长裤盖住、明显凉鞋裸脚、清楚裸足、广告图/家具等），保留"有"和"不确定"。这取代了脆弱的关键词匹配 —— 让模型读懂**语义**，比关键词和置信度都稳。Ollama 不可用时**fail-open**（全保留，绝不静默丢弃）。
 
 > 实测一个 2 小时视频：~184 个噪声候选 → ~22 个干净、真实的场景。
 
@@ -109,6 +110,8 @@ app.run(port=8765)
 | `GPU_BASE_URL` | `localhost` | Ollama 主机（自动补 `:11434`）|
 | `INSPECTOR_COARSE_CONCURRENCY` | `6` | 粗筛批次并发数 |
 | `INSPECTOR_CROP_ZOOM` | `0` | 开启裁剪放大复核（需 `[cropzoom]`）|
+| `INSPECTOR_SECOND_CHANCE` | `1` | 二次机会裁剪召回（需 `[cropzoom]`；姿态 worker 不可用时自动跳过）|
+| `INSPECTOR_SECOND_CHANCE_MAX_CROPS` | `400` | 单视频二次机会姿态扫描帧数上限 |
 | `SHEERSCAN_LOCAL_DIR` | `~/sheerscan-local` | 任务产物 / 帧 / 语料的本地目录 |
 
 > ⚠️ 别开 `INSPECTOR_EXTREME_RECALL` 和 `INSPECTOR_STRICT_EVIDENCE_FILTER` —— 前者是隐藏的刷屏来源，后者会严重砸召回。
@@ -148,7 +151,8 @@ sheerscan.configure(settings=MySettings(), pathmap=MyPathMapper())
 
 - **语料（ground truth）**：`sheerscan/corpus.py`。语料 manifest（`tests/inspector_corpus/manifest.jsonl`，含哈希 `video_id` + 中文 `reason` 描述）、真实帧、`video_id→路径` 映射**都留在本地、不随仓库发布**（gitignored）。仓库只保留 `baseline.json` 作为回归目标。本地跑 `sheerscan corpus harvest` 会在本机生成 manifest。
 - **重放对比**：
-  - `sheerscan replay --mode postprocess` —— **免费、确定性** 的重放：把每个已录 trace 通过*当前*后处理代码重建检测并对语料打分。改过滤/去重/窗口逻辑时用它。`--set key=value` 覆盖某个旋钮，`--compare baseline.json` 看 recall/precision 增量。
+  - `sheerscan replay --mode postprocess` —— **免费、确定性** 的重放：把每个已录 trace 通过*当前*后处理代码重建检测并对语料打分。改过滤/去重/窗口逻辑时用它。`--set key=value` 覆盖某个旋钮，`--compare baseline.json` 看 recall/precision 增量。重放会跑**完整的现役 pipeline**：语义 reason 过滤（`INSPECTOR_REASON_FILTER` 开时；判定走本地 Ollama，缓存命中后免费）和 crop-zoom 闸（`--set crop_gate=0.3`，复用 live run 存在 result.json 里的 `crop_score`）。语料里**没有任何 trace** 的视频会列在 `uncovered_videos` 里、不参与打分——那是 harness 覆盖率问题，不是 pipeline 质量问题。
+  - ⚠️ 实测**别开 crop gate**（`INSPECTOR_CROP_ZOOM_DROP_BELOW`）：现用的 rescore prompt+model 过于保守，真阳的 crop_score 中位数也只有 ~0.1，任何阈值都是 1:1 拿召回换精度。先换/校准 rescore 模型再谈闸。
   - `sheerscan replay --mode frames --model <id>` —— 在已标注帧上做模型/prompt 的 A/B（**会花 API**）。
 - **诚实精度需要负样本**：一个未匹配的检测，只有落在标注的负样本附近才算误报，否则算"未知"。
 - **回归测试**：`tests/test_inspector_regression.py` —— 一个可移植 fixture 测试 + 一个真实数据测试（断言 recall/precision ≥ `baseline.json`，无本地 trace 时自动跳过）。

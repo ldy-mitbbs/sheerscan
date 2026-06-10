@@ -22,8 +22,9 @@ def _parse_overrides(pairs) -> dict:
     """Parse --set key=value overrides for replay post-processing knobs."""
     overrides: dict = {}
     bool_keys = {"extreme_recall", "require_concrete_evidence", "keep_low_fine",
-                 "keep_coarse_on_fine_empty", "exclude_male_subject", "skip_fine", "drop_weak_coarse"}
-    float_keys = {"rep_offset", "dedup_window", "scene_support_window"}
+                 "keep_coarse_on_fine_empty", "exclude_male_subject", "skip_fine", "drop_weak_coarse",
+                 "reason_filter"}
+    float_keys = {"rep_offset", "dedup_window", "scene_support_window", "crop_gate"}
     int_keys = {"min_scene_support"}
     for pair in pairs or []:
         if "=" not in pair:
@@ -143,10 +144,14 @@ def cmd_replay(args) -> int:
         )
         print(
             f"Post-processing replay over corpus: videos={metrics['videos']} "
-            f"(with detections {metrics['videos_with_detections']}) "
+            f"(with detections {metrics['videos_with_detections']}, "
+            f"uncovered {len(metrics.get('uncovered_videos') or [])}/{metrics.get('corpus_videos_total', metrics['videos'])}) "
             f"tp={metrics['true_positives']} fn={metrics['false_negatives']} fp={metrics['false_positives']} "
             f"recall={metrics['recall']} precision={metrics['precision']} f1={metrics['f1']}"
         )
+        rf = metrics.get("reason_filter")
+        if rf:
+            print(f"  reason filter: available={rf['available']} kept {rf['kept']}/{rf['input']} (dropped {rf['dropped']})")
         if args.compare:
             baseline = json.loads(Path(args.compare).read_text(encoding="utf-8"))
             diff = compare_eval_runs(baseline, metrics)
