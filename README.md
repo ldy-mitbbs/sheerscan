@@ -105,6 +105,7 @@ app.run(port=8765)
 | `MULEROUTER_API_KEY` / `OPENROUTER_API_KEY` | — | API key（建议放环境变量）|
 | `INSPECTOR_MODEL` | `qwen3.6-flash` | 粗筛模型 |
 | `INSPECTOR_INTERVAL` | `5` | 抽帧间隔（秒），越小候选越多 |
+| `INSPECTOR_DENSE_KEYFRAME_RECALL` | `0` | 保留全部 I 帧（带真实 pts）替代固定网格——让落在网格之间的短插入镜头（如脚尖特写）也有候选；后接现有 dhash 去重封顶成本（实测 60 分钟 .ts 约 4× 粗筛调用）。不依赖人体/姿态检测 |
 | `INSPECTOR_REASON_FILTER` | `0` | 开启语义 reason 过滤（强烈建议开）|
 | `INSPECTOR_REASON_FILTER_MODEL` | `qwen2.5:3b` | reason 过滤用的本地 Ollama 模型 |
 | `GPU_BASE_URL` | `localhost` | Ollama 主机（自动补 `:11434`）|

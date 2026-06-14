@@ -22,10 +22,12 @@ pipeline. Treat these as feature flags, not dead code:
   • screenshot two-pass    — the non-default ``INSPECTOR_MODE=screenshot`` branch
   • verifier pass          — ``verify_visual_detections`` (INSPECTOR_VERIFY_ENABLED)
   • local CLIP prefilter   — ``_clip_prefilter_frames`` etc. (INSPECTOR_LOCAL_CLIP_ENABLED)
+  • dense-keyframe recall  — ``_extract_keyframes_dense`` (INSPECTOR_DENSE_KEYFRAME_RECALL). Keeps every I-frame (real pts) instead of the interval grid so brief insert shots — e.g. a foot/toe close-up — between grid points still get a candidate; the existing dhash dedup bounds cost (~4x coarse calls on a 60min .ts). Feet-agnostic: no pose/person detection (the pose gate is blind to toe-only close-ups).
   • crop-zoom enrichment   — ``_apply_crop_zoom`` (INSPECTOR_CROP_ZOOM)
   • extreme-recall / keyword / confidence-drop / strict-evidence branches — all default off
 """
 import base64
+import bisect
 import json
 import os
 import re
@@ -553,6 +555,15 @@ def dedupe_similar_frames(frames, threshold=6):
     for frame in frames:
         dhash = image_dhash(frame.get("file_path"))
         frame["local_dhash"] = dhash
+        # Grid-aligned frames (dense-keyframe mode) are never dropped, so the
+        # dense set stays a superset of the interval grid — see
+        # _extract_keyframes_dense. They still seed seen_hashes to suppress
+        # later near-duplicates.
+        if frame.get("protected_grid"):
+            if dhash is not None:
+                seen_hashes.append(dhash)
+            kept.append(frame)
+            continue
         if dhash is None:
             kept.append(frame)
             continue
@@ -2102,6 +2113,17 @@ class VideoInspector:
         return frames
 
     def extract_frames(self, video_path, temp_dir, interval):
+        # Opt-in dense-keyframe recall: keep EVERY I-frame instead of an
+        # `interval` grid, so brief insert shots that fall between grid points
+        # still contribute a candidate (the downstream dhash dedup bounds cost).
+        if is_truthy_setting(get_setting("INSPECTOR_DENSE_KEYFRAME_RECALL", "0")):
+            try:
+                frames = self._extract_keyframes_dense(video_path, temp_dir, interval)
+                if frames:
+                    return frames
+            except Exception as e:
+                print(f"dense keyframe extraction failed, falling back to interval grid: {e}")
+
         # Fast path: a single linear ffmpeg decode (`fps=1/interval`) instead of
         # ~thousands of individual PyAV seeks, which is pathological on long
         # interlaced MPEG2 transport streams (each seek re-decodes a whole GOP).
@@ -2174,6 +2196,100 @@ class VideoInspector:
                 "timestamp_str": format_seconds(sec),
                 "id": f"frame_{i + 1:04d}",
             })
+        return frames
+
+    def _extract_keyframes_dense(self, video_path, temp_dir, interval):
+        """Extract EVERY I-frame (not an `interval` grid), tagged with real PTS.
+
+        Opt-in via ``INSPECTOR_DENSE_KEYFRAME_RECALL``. A brief insert shot
+        (e.g. a foot/toe close-up) that falls between the grid points is its own
+        camera shot and almost always carries an I-frame; keeping all I-frames
+        guarantees >=1 candidate inside such a shot regardless of where the grid
+        lands. The downstream local dhash dedup (``local_prefilter_frames``)
+        collapses near-duplicate keyframes — measured ~3276 I-frames -> ~1814
+        survivors (~4.7x the interval grid; includes the grid-aligned frames
+        protected below), so cost stays bounded, not 1-per-GOP.
+
+        Timestamps come from the decoder's real pts (the ``showinfo`` filter,
+        same pass as the JPEG writes so they stay aligned), normalized so the
+        first I-frame is ~0. ``i*interval`` indexing is invalid here because
+        keyframes are not uniformly spaced.
+        """
+        out_pattern = str(Path(temp_dir) / "frame_%05d.jpg")
+        max_w = get_int_setting("INSPECTOR_COARSE_MAX_WIDTH", 1024, min_value=512, max_value=3840)
+        vf = f"scale='min({max_w},iw)':-2,showinfo"
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
+               "-skip_frame", "nokey", "-i", str(video_path),
+               "-vf", vf, "-fps_mode", "passthrough", "-q:v", "3", out_pattern]
+        # errors="replace": ffmpeg writes the source path + decode warnings to
+        # stderr, which may contain non-UTF-8 bytes (e.g. Shift-JIS filenames).
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        files = sorted(Path(temp_dir).glob("frame_*.jpg"))
+        if not files:
+            raise RuntimeError(f"ffmpeg keyframe extraction produced no frames: {res.stderr[-300:]}")
+
+        # showinfo logs one "n:<i> ... pts_time:<t>" line per output frame, in
+        # write order, so n:i maps to the i-th sorted JPEG (start_number=1).
+        pts_by_n = {}
+        for m in re.finditer(r"n:\s*(\d+).*?pts_time:\s*([0-9.]+)", res.stderr):
+            pts_by_n[int(m.group(1))] = float(m.group(2))
+        if not pts_by_n:
+            # No usable timestamps -> remove the frames we just wrote so the
+            # interval-grid fallback in extract_frames starts from a clean dir,
+            # then let it take over.
+            for f in files:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError("showinfo returned no pts_time for keyframes")
+
+        base = None
+        last = 0.0
+        frames = []
+        for i, fp in enumerate(files):
+            t = pts_by_n.get(i)
+            if t is not None:
+                if base is None:
+                    base = t
+                last = max(0.0, t - base)
+            sec = round(last, 3)
+            frames.append({
+                "file_path": fp,
+                "seconds": float(sec),
+                "timestamp_str": format_seconds(sec),
+                "id": f"frame_{i + 1:04d}",
+            })
+
+        # Make the dense set a superset of the interval grid in FRAMES: mark the
+        # I-frame nearest each i*interval grid point as protected so the
+        # downstream dhash dedup never drops it. The plain grid (``_run_ffmpeg_fps``
+        # with ``fps=1/interval``) samples exactly one keyframe per interval slot,
+        # so these protected frames ARE the grid's frames — every grid-aligned
+        # frame is therefore guaranteed to reach the coarse VLM.
+        #
+        # Caveat (measured on #42.ts): this guarantees frame COVERAGE, not
+        # detection parity. Live grid-only "regressions" barely moved (11 -> 9)
+        # because their dominant cause is VLM + reason-filter stochasticity on
+        # borderline "smooth bare leg vs flesh-tone hosiery" frames, not dedup
+        # frame selection — the protected frame is sent, the model just judges it
+        # differently run-to-run. Closing that churn needs per-frame voting or a
+        # steadier rescore model, not the sampler.
+        try:
+            interval = max(0.5, float(interval))
+        except (TypeError, ValueError):
+            interval = 0.0
+        if interval > 0 and frames:
+            secs = [f["seconds"] for f in frames]
+            duration = secs[-1]
+            t = 0.0
+            while t <= duration + 1e-9:
+                j = bisect.bisect_left(secs, t)
+                best = j if j < len(secs) else len(secs) - 1
+                if j > 0 and abs(secs[j - 1] - t) <= abs(secs[best] - t):
+                    best = j - 1
+                frames[best]["protected_grid"] = True
+                t += interval
         return frames
 
     def merge_intervals(self, intervals):
