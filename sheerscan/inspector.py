@@ -1187,6 +1187,19 @@ class VideoInspector:
         }
         return mappings.get(model, model)
 
+    def _response_format(self):
+        """The OpenAI ``response_format`` value for chat/completions, or None to omit it.
+
+        Defaults to ``json_object`` (mulerouter/openrouter). Some OpenAI-compatible
+        servers (e.g. LM Studio) reject ``json_object`` and only accept ``json_schema``
+        or ``text``; set ``INSPECTOR_RESPONSE_FORMAT=text`` to drop the field and let
+        ``_extract_json`` recover the JSON from the model's prose.
+        """
+        mode = str(get_setting("INSPECTOR_RESPONSE_FORMAT", "json_object") or "json_object").strip().lower()
+        if mode in {"text", "none", "off", ""}:
+            return None
+        return {"type": "json_object"}
+
     def _append_trace_event(self, job_dir: Path, event: dict):
         trace_path = Path(job_dir) / "trace.json"
         with self._trace_lock:
@@ -2472,8 +2485,10 @@ class VideoInspector:
             ],
             "temperature": 0.1,
             "top_p": 0.9,
-            "response_format": {"type": "json_object"}
         }
+        _rf = self._response_format()
+        if _rf is not None:
+            payload["response_format"] = _rf
 
         url = f"{self._api_base_url().rstrip('/')}/chat/completions"
         try:
@@ -2574,8 +2589,10 @@ class VideoInspector:
                 }
             ],
             "temperature": 0,
-            "response_format": {"type": "json_object"},
         }
+        _rf = self._response_format()
+        if _rf is not None:
+            payload["response_format"] = _rf
 
         try:
             url = f"{self._api_base_url().rstrip('/')}/chat/completions"
