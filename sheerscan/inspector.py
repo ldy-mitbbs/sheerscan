@@ -54,6 +54,7 @@ from .runtime import (
     get_local_video_dir,
     to_host_path,
     to_container_path,
+    scene_cuts,
 )
 
 _LOCAL_CLIP_STATE = {
@@ -2129,6 +2130,21 @@ class VideoInspector:
         # Opt-in dense-keyframe recall: keep EVERY I-frame instead of an
         # `interval` grid, so brief insert shots that fall between grid points
         # still contribute a candidate (the downstream dhash dedup bounds cost).
+        # Scene-grid recall: sample the interval grid PLUS true shot boundaries
+        # (scene cuts the host app produced as a byproduct of its transcode).
+        # Catches brief insert shots like dense keyframe recall, but only pays
+        # the VLM for grid + cuts, not every I-frame. Falls through to the grid
+        # (+ dedup) when no scene-cut data exists for this video.
+        if is_truthy_setting(get_setting("INSPECTOR_SCENE_GRID_RECALL", "0")):
+            cuts = scene_cuts(video_path)
+            if cuts:
+                try:
+                    frames = self._extract_scene_grid(video_path, temp_dir, interval, cuts)
+                    if frames:
+                        return frames
+                except Exception as e:
+                    print(f"scene-grid extraction failed, falling back to interval grid: {e}")
+
         if is_truthy_setting(get_setting("INSPECTOR_DENSE_KEYFRAME_RECALL", "0")):
             try:
                 frames = self._extract_keyframes_dense(video_path, temp_dir, interval)
@@ -2199,6 +2215,24 @@ class VideoInspector:
                 except OSError:
                     pass
             files = self._run_ffmpeg_fps(video_path, temp_dir, interval, keyframe_only=False)
+        elif expected and len(files) > 1.5 * expected:
+            # `fps=1/interval` silently failed to thin this source — on dense-GOP
+            # broadcast .ts whose keyframes are *denser* than `interval`, ffmpeg
+            # passes every keyframe through (e.g. a 2s GOP yields ~4x the frames
+            # an 8s interval intends). Subsample the keyframe list onto the
+            # interval grid so we honor INSPECTOR_INTERVAL instead of paying the
+            # VLM for every keyframe. Keyframes are ~uniformly spaced, so an even
+            # stride lands on the grid and `i*interval` timing stays valid.
+            step = max(2, round(len(files) / expected))
+            kept = files[::step]
+            kept_set = set(kept)
+            for f in files:
+                if f not in kept_set:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+            files = kept
 
         frames = []
         for i, fp in enumerate(files):
@@ -2304,6 +2338,42 @@ class VideoInspector:
                 frames[best]["protected_grid"] = True
                 t += interval
         return frames
+
+    def _extract_scene_grid(self, video_path, temp_dir, interval, cuts):
+        """Keep the interval grid PLUS keyframes at shot boundaries (`cuts`).
+
+        Extracts every keyframe (cheap, local), then drops the ones that are
+        neither grid-aligned nor near a scene cut, so the VLM only sees the grid
+        + true shot boundaries. The dropped JPEGs are unlinked to free disk.
+        `cuts` are exact cut seconds from the host's transcode-side detector;
+        keyframes are ~GOP-spaced, so we keep the keyframe nearest each cut."""
+        frames = self._extract_keyframes_dense(video_path, temp_dir, interval)
+        if not frames:
+            return frames
+        cutset = sorted(float(c) for c in cuts)
+        tol = max(1.5, float(interval) / 4.0)
+
+        def near_cut(t):
+            if not cutset:
+                return False
+            i = bisect.bisect_left(cutset, t)
+            for j in (i - 1, i):
+                if 0 <= j < len(cutset) and abs(cutset[j] - t) <= tol:
+                    return True
+            return False
+
+        kept = [f for f in frames
+                if f.get("protected_grid") or near_cut(float(f.get("seconds") or 0.0))]
+        kept_ids = {id(f) for f in kept}
+        for f in frames:
+            if id(f) not in kept_ids:
+                try:
+                    Path(f["file_path"]).unlink()
+                except OSError:
+                    pass
+        for i, f in enumerate(kept):
+            f["id"] = f"frame_{i + 1:04d}"
+        return kept
 
     def merge_intervals(self, intervals):
         if not intervals:

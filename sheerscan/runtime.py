@@ -135,3 +135,25 @@ def to_host_path(path: str) -> str:
 
 def to_container_path(path: str) -> str:
     return _pathmap.to_container(path)
+
+
+def scene_cuts(path: str):
+    """Scene-cut timestamps (seconds) for a video, if the host app supplies them.
+
+    A host app can produce these cheaply as a byproduct of its transcode (which
+    already full-decodes) and expose them via an optional ``scene_cuts`` method
+    on its PathMapper. Returns a sorted list of seconds, or None when no host
+    hook / no data exists (the inspector then falls back to grid + dedup)."""
+    fn = getattr(_pathmap, "scene_cuts", None)
+    if fn is None:
+        return None
+    try:
+        cuts = fn(path)
+    except Exception:
+        return None
+    if not cuts:
+        return None
+    try:
+        return sorted(float(c) for c in cuts)
+    except (TypeError, ValueError):
+        return None
