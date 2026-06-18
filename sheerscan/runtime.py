@@ -148,7 +148,7 @@ def scene_cuts(path: str):
     if fn is None:
         return None
     try:
-        cuts = fn(path)
+        cuts = fn(str(path))   # callers may pass a Path; host hooks expect a str
     except Exception:
         return None
     if not cuts:
