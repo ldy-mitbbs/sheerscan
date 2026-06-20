@@ -18,6 +18,7 @@ from typing import Optional
 
 from .runtime import get_setting
 from .ollama import Ollama, OllamaError
+from .openai_chat import OpenAIChat, OpenAIChatError
 
 _SYSTEM = (
     "你是中文文本判别器。给你一段对视频画面的描述，判断它的【最终结论】是说画面里有"
@@ -45,6 +46,24 @@ def reason_filter_host() -> str:
     return "http://localhost:11434"
 
 
+def reason_filter_backend() -> str:
+    """Which LLM backend serves the reason filter: 'ollama' (default) or
+    'openai' (any OpenAI-compatible server, e.g. LM Studio on a local GPU)."""
+    return str(get_setting("INSPECTOR_REASON_FILTER_BACKEND", "ollama") or "ollama").strip().lower()
+
+
+def reason_filter_base_url() -> str:
+    """OpenAI-compatible base URL for the 'openai' backend. Explicit setting wins;
+    otherwise derive from GPU_BASE_URL (LM Studio's :1234), else localhost."""
+    url = get_setting("INSPECTOR_REASON_FILTER_BASE_URL", None)
+    if url:
+        return str(url)
+    gpu = get_setting("GPU_BASE_URL", None)
+    if gpu:
+        return f"{str(gpu).rstrip('/').rstrip(':')}:1234/v1"
+    return "http://localhost:1234/v1"
+
+
 def reason_filter_model() -> str:
     return get_setting("INSPECTOR_REASON_FILTER_MODEL", "qwen2.5:3b")
 
@@ -62,9 +81,15 @@ class ReasonClassifier:
     """Caches an Ollama client + per-reason verdicts for one inspection run."""
 
     def __init__(self, cache=None):
-        self._ollama = Ollama(model=reason_filter_model(), host=reason_filter_host(), cache=cache, timeout=30.0)
+        if reason_filter_backend() == "openai":
+            self._client = OpenAIChat(model=reason_filter_model(),
+                                      base_url=reason_filter_base_url(),
+                                      api_key=get_setting("INSPECTOR_REASON_FILTER_API_KEY", "lm-studio") or "lm-studio",
+                                      cache=cache, timeout=30.0)
+        else:
+            self._client = Ollama(model=reason_filter_model(), host=reason_filter_host(), cache=cache, timeout=30.0)
         self._memo: dict[str, str] = {}
-        self.available = self._ollama.ping()
+        self.available = self._client.ping()
 
     def classify(self, reason: str) -> str:
         text = str(reason or "").strip()
@@ -74,9 +99,9 @@ class ReasonClassifier:
             return self._memo[text]
         cache_key = "reasonfilter:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
         try:
-            out = self._ollama.generate_json(_build_prompt(text), system=_SYSTEM, cache_key=cache_key)
+            out = self._client.generate_json(_build_prompt(text), system=_SYSTEM, cache_key=cache_key)
             verdict = _normalize(out.get("r") or out.get("verdict") or out.get("v"))
-        except (OllamaError, AttributeError, Exception):
+        except (OllamaError, OpenAIChatError, AttributeError, Exception):
             # On any failure, do NOT drop the candidate — fail open to human review.
             verdict = "uncertain"
         self._memo[text] = verdict
