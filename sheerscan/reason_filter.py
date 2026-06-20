@@ -28,6 +28,16 @@ _SYSTEM = (
 )
 
 
+# Structured-output schema for the OpenAI/LM Studio backend: forces a valid
+# {"r": "yes"|"no"|"uncertain"} reply (the Ollama backend ignores it, using
+# its own format=json).
+_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {"r": {"type": "string", "enum": ["yes", "no", "uncertain"]}},
+    "required": ["r"],
+}
+
+
 def _build_prompt(reason: str) -> str:
     return (
         "判断下面这段描述：\n"
@@ -99,7 +109,8 @@ class ReasonClassifier:
             return self._memo[text]
         cache_key = "reasonfilter:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
         try:
-            out = self._client.generate_json(_build_prompt(text), system=_SYSTEM, cache_key=cache_key)
+            out = self._client.generate_json(_build_prompt(text), system=_SYSTEM,
+                                             cache_key=cache_key, schema=_VERDICT_SCHEMA)
             verdict = _normalize(out.get("r") or out.get("verdict") or out.get("v"))
         except (OllamaError, OpenAIChatError, AttributeError, Exception):
             # On any failure, do NOT drop the candidate — fail open to human review.

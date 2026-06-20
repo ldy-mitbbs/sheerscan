@@ -123,6 +123,7 @@ class Ollama:
         system: Optional[str] = None,
         cache_key: Optional[str] = None,
         temperature: float = 0.0,
+        schema: Optional[dict] = None,   # accepted for a uniform call site; Ollama uses format=json
     ) -> Any:
         """Run prompt; expect JSON back. Uses cache if cache_key provided."""
         if cache_key and self.cache:

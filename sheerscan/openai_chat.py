@@ -57,6 +57,7 @@ class OpenAIChat:
         system: Optional[str] = None,
         cache_key: Optional[str] = None,
         temperature: float = 0.0,
+        schema: Optional[dict] = None,
     ) -> Any:
         if cache_key and self.cache:
             cached = self.cache.get_llm(cache_key, self.model)
@@ -68,6 +69,13 @@ class OpenAIChat:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         payload = {"model": self.model, "messages": messages, "temperature": temperature}
+        if schema is not None:
+            # Structured output (LM Studio supports json_schema, not json_object):
+            # constrains the reply to valid JSON matching the schema.
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "out", "strict": True, "schema": schema},
+            }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions", data=data,
