@@ -137,6 +137,19 @@ def to_container_path(path: str) -> str:
     return _pathmap.to_container(path)
 
 
+def ensure_model(model: str) -> None:
+    """Ask the host app to make `model` the resident one on its inference server
+    (e.g. free VRAM for the coarse vision model on a small local GPU). Optional —
+    no-op when the host PathMapper doesn't provide ``ensure_model``."""
+    fn = getattr(_pathmap, "ensure_model", None)
+    if fn is None or not model:
+        return
+    try:
+        fn(str(model))
+    except Exception:
+        pass
+
+
 def scene_cuts(path: str):
     """Scene-cut timestamps (seconds) for a video, if the host app supplies them.
 

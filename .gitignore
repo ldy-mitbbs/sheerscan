@@ -12,3 +12,4 @@ sheerscan-local/
 *.onnx
 # corpus manifest stays local — contains explicit reason text (not for publish)
 tests/inspector_corpus/manifest.jsonl
+.DS_Store

@@ -55,6 +55,7 @@ from .runtime import (
     to_host_path,
     to_container_path,
     scene_cuts,
+    ensure_model,
 )
 
 _LOCAL_CLIP_STATE = {
@@ -1159,17 +1160,29 @@ class VideoInspector:
 
     def _api_provider(self) -> str:
         provider = str(get_setting("INSPECTOR_API_PROVIDER", "mulerouter") or "mulerouter").strip().lower()
-        return provider if provider in {"openrouter", "mulerouter"} else "openrouter"
+        return provider if provider in {"openrouter", "mulerouter", "openai", "lmstudio"} else "openrouter"
 
     def _api_base_url(self) -> str:
-        if self._api_provider() == "mulerouter":
+        p = self._api_provider()
+        if p == "mulerouter":
             default_base = "https://api.mulerouter.ai/vendors/openai/v1"
             return str(get_setting("MULEROUTER_BASE_URL", default_base) or default_base)
+        if p in ("openai", "lmstudio"):
+            # Generic OpenAI-compatible endpoint (e.g. LM Studio on a local GPU).
+            url = get_setting("INSPECTOR_OPENAI_BASE_URL", None)
+            if url:
+                return str(url)
+            gpu = get_setting("GPU_BASE_URL", None)
+            return f"{str(gpu).rstrip('/').rstrip(':')}:1234/v1" if gpu else "http://localhost:1234/v1"
         return str(get_setting("OPENROUTER_BASE_URL", self.openrouter_base_url) or self.openrouter_base_url)
 
     def _api_key(self) -> str:
-        if self._api_provider() == "mulerouter":
+        p = self._api_provider()
+        if p == "mulerouter":
             return get_secret("MULEROUTER_API_KEY") or os.environ.get("MULEROUTER_API_KEY") or ""
+        if p in ("openai", "lmstudio"):
+            return (get_secret("INSPECTOR_OPENAI_API_KEY")
+                    or os.environ.get("INSPECTOR_OPENAI_API_KEY") or "lm-studio")
         return get_secret("OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
 
     def _normalize_model_name(self, model_name: str) -> str:
@@ -2861,6 +2874,11 @@ class VideoInspector:
 
         api_key = self._api_key()
         coarse_model_name = get_setting("INSPECTOR_MODEL", INSPECTOR_RECOMMENDED_COARSE_MODEL)
+        # On a small local GPU the coarse vision model can't share VRAM with the
+        # text models; make it the sole resident model before extraction so the
+        # swap overlaps the (local, minutes-long) frame extraction. No-op on
+        # cloud providers. Text stages JIT-reload their own model afterward.
+        ensure_model(coarse_model_name)
         fine_model_name = get_setting("INSPECTOR_FINE_MODEL", INSPECTOR_RECOMMENDED_FINE_MODEL)
         if not fine_model_name:
             fine_model_name = coarse_model_name
@@ -3453,6 +3471,11 @@ class VideoInspectorJobManager:
         self.inspector = VideoInspector()
         self.jobs = {}
         self.lock = threading.Lock()
+        # Serialize concurrent inspections (default 1). A slow local-GPU coarse
+        # backend (LM Studio on a 16GB card) OOM-crashes if hit by parallel
+        # passes, so queued jobs run one at a time; raise for a cloud backend.
+        n = get_int_setting("INSPECTOR_MAX_CONCURRENT_JOBS", 1, min_value=1, max_value=8)
+        self._run_sem = threading.Semaphore(n)
         self._load_persisted_jobs()
 
     def _load_persisted_jobs(self):
@@ -3532,30 +3555,39 @@ class VideoInspectorJobManager:
         return job_id
 
     def _run_job(self, job_id, container_path, interval):
-        self._update_job(job_id, status="running", progress=1, message="Starting")
-
-        def progress_cb(progress, message):
-            self._update_job(job_id, status="running", progress=progress, message=message)
-
+        # Wait our turn (serialized by _run_sem) so a slow local GPU isn't hit
+        # by parallel coarse passes; stay "queued" while waiting.
+        if not self._run_sem.acquire(blocking=False):
+            self._update_job(job_id, status="queued", progress=0,
+                             message="Queued — waiting for the GPU…")
+            self._run_sem.acquire()
         try:
-            result = self.inspector.run_inspection(container_path, interval, job_id, progress_cb=progress_cb)
-            self._update_job(
-                job_id,
-                status="completed",
-                progress=100,
-                message="Completed",
-                result=result,
-            )
-        except Exception as exc:
-            error_text = str(exc)
-            self._update_job(
-                job_id,
-                status="failed",
-                progress=100,
-                message="Failed",
-                error=error_text,
-                error_info=explain_inspector_error(error_text),
-            )
+            self._update_job(job_id, status="running", progress=1, message="Starting")
+
+            def progress_cb(progress, message):
+                self._update_job(job_id, status="running", progress=progress, message=message)
+
+            try:
+                result = self.inspector.run_inspection(container_path, interval, job_id, progress_cb=progress_cb)
+                self._update_job(
+                    job_id,
+                    status="completed",
+                    progress=100,
+                    message="Completed",
+                    result=result,
+                )
+            except Exception as exc:
+                error_text = str(exc)
+                self._update_job(
+                    job_id,
+                    status="failed",
+                    progress=100,
+                    message="Failed",
+                    error=error_text,
+                    error_info=explain_inspector_error(error_text),
+                )
+        finally:
+            self._run_sem.release()
 
     def _update_job(self, job_id, **fields):
         with self.lock:
