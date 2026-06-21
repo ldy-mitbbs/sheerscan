@@ -114,36 +114,10 @@ def heuristic_crop_region(img: Image.Image):
     return crop, _HEURISTIC_BOX
 
 
-def pose_crop_region(img: Image.Image, min_w: int = 512):
-    """Tight crop around the most prominent person's legs/feet via YOLO-pose.
-
-    Returns (crop, normalized_box) or None (caller falls back to heuristic) when
-    no person with visible knee/ankle keypoints is found."""
-    model = _load_pose_model()
-    if model is None:
-        return None
-    try:
-        res = model(np.asarray(img), verbose=False)[0]
-    except Exception as e:
-        print(f"crop_zoom: pose inference failed ({str(e)[:100]})")
-        return None
-    if res.keypoints is None or res.keypoints.data is None or len(res.keypoints.data) == 0:
-        return None
-    kps = res.keypoints.data.cpu().numpy()              # (n_person, 17, 3): x,y,conf
-    boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else None
-
-    best, best_area = None, -1.0
-    for i, person in enumerate(kps):
-        legs = person[_KNEE_ANKLE_KP]
-        if len(legs[legs[:, 2] > 0.30]) < 2:            # need >=2 visible knee/ankle pts
-            continue
-        area = float((boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1])) if boxes is not None else 1.0
-        if area > best_area:                            # most prominent subject wins
-            best, best_area = person, area
-    if best is None:
-        return None
-
-    pts = best[_LEG_KP]
+def _person_leg_crop(person, img: Image.Image, min_w: int):
+    """Build the tight leg/foot crop for one YOLO-pose person. Returns
+    (crop, normalized_box) or None when the legs aren't usably visible."""
+    pts = person[_LEG_KP]
     pts = pts[pts[:, 2] > 0.30]
     if len(pts) < 2:
         return None
@@ -162,6 +136,60 @@ def pose_crop_region(img: Image.Image, min_w: int = 512):
         crop = crop.resize((min_w, max(1, int(crop.height * min_w / crop.width))), Image.LANCZOS)
     norm_box = (box[0] / W, box[1] / H, box[2] / W, box[3] / H)
     return crop, norm_box
+
+
+def _pose_people_with_legs(img: Image.Image):
+    """Run YOLO-pose; return [(area, person_keypoints), ...] for every person
+    with >=2 visible knee/ankle points, largest first. Empty list on no hit."""
+    model = _load_pose_model()
+    if model is None:
+        return []
+    try:
+        res = model(np.asarray(img), verbose=False)[0]
+    except Exception as e:
+        print(f"crop_zoom: pose inference failed ({str(e)[:100]})")
+        return []
+    if res.keypoints is None or res.keypoints.data is None or len(res.keypoints.data) == 0:
+        return []
+    kps = res.keypoints.data.cpu().numpy()              # (n_person, 17, 3): x,y,conf
+    boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else None
+    out = []
+    for i, person in enumerate(kps):
+        legs = person[_KNEE_ANKLE_KP]
+        if len(legs[legs[:, 2] > 0.30]) < 2:            # need >=2 visible knee/ankle pts
+            continue
+        area = float((boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1])) if boxes is not None else 1.0
+        out.append((area, person))
+    out.sort(key=lambda c: c[0], reverse=True)          # most prominent first
+    return out
+
+
+def pose_crop_region(img: Image.Image, min_w: int = 512):
+    """Tight crop around the most prominent person's legs/feet via YOLO-pose.
+
+    Returns (crop, normalized_box) or None (caller falls back to heuristic) when
+    no person with visible knee/ankle keypoints is found."""
+    for _area, person in _pose_people_with_legs(img):
+        res = _person_leg_crop(person, img, min_w)
+        if res is not None:
+            return res
+    return None
+
+
+def pose_crop_regions(img: Image.Image, min_w: int = 512, max_persons: int = 4):
+    """Like :func:`pose_crop_region` but returns a crop for EVERY person whose
+    legs are visible (largest first, capped at ``max_persons``). A multi-person
+    frame then doesn't lose the non-dominant subject — the case where a seated
+    person's legs sit behind a standing one the area-ranked single crop would
+    miss. Returns a list of (crop, normalized_box); empty when no legs found."""
+    out = []
+    for _area, person in _pose_people_with_legs(img):
+        res = _person_leg_crop(person, img, min_w)
+        if res is not None:
+            out.append(res)
+        if len(out) >= max_persons:
+            break
+    return out
 
 
 def make_crop(video_path, seconds: float, out_path: Path, *, max_w: int = 1600,
@@ -183,6 +211,34 @@ def make_crop(video_path, seconds: float, out_path: Path, *, max_w: int = 1600,
     out_path.parent.mkdir(parents=True, exist_ok=True)
     region.save(out_path, "JPEG", quality=92)
     return {"used_pose": used_pose, "box": [round(v, 4) for v in box]}
+
+
+def make_crops_multi(video_path, seconds: float, out_prefix: str, *, max_w: int = 1600,
+                     min_w: int = 512, max_persons: int = 4) -> list:
+    """Extract the native frame at `seconds` and save ONE leg/foot crop per
+    visible person to ``{out_prefix}_p{idx}.jpg``. Returns a list of
+    {"out_path", "box", "used_pose"} (largest person first). When pose finds no
+    legs, falls back to a single heuristic crop. Empty list if extraction fails.
+
+    Pose detection (opencv) — run in the subprocess worker, not the serve
+    process."""
+    frame = extract_native_frame(video_path, seconds, max_w=max_w)
+    if frame is None:
+        return []
+    regions = pose_crop_regions(frame, min_w=min_w, max_persons=max_persons)
+    out = []
+    if not regions:
+        region, box = heuristic_crop_region(frame)
+        p = Path(f"{out_prefix}_p0.jpg")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        region.save(p, "JPEG", quality=92)
+        return [{"out_path": str(p), "box": [round(v, 4) for v in box], "used_pose": False}]
+    for idx, (region, box) in enumerate(regions):
+        p = Path(f"{out_prefix}_p{idx}.jpg")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        region.save(p, "JPEG", quality=92)
+        out.append({"out_path": str(p), "box": [round(v, 4) for v in box], "used_pose": True})
+    return out
 
 
 def second_chance_crop(video_path, seconds: float, image_path, out_path, *,
@@ -246,8 +302,11 @@ def make_crops_via_subprocess(video_path, items: list[dict], *, max_w: int = 160
         spec_path.write_text(json.dumps({
             "video_path": str(video_path), "max_w": max_w, "min_w": min_w,
             "result_path": str(result_path),
-            "items": [{"seconds": float(i["seconds"]), "out_path": str(i["out_path"]),
-                       **({"image_path": str(i["image_path"])} if i.get("image_path") else {})}
+            "items": [{"seconds": float(i["seconds"]),
+                       "out_path": str(i.get("out_path") or ""),
+                       **({"image_path": str(i["image_path"])} if i.get("image_path") else {}),
+                       **({"multi": True, "out_prefix": str(i["out_prefix"]),
+                           "max_persons": int(i.get("max_persons", 4))} if i.get("multi") else {})}
                       for i in items],
         }), encoding="utf-8")
         try:

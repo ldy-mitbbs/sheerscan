@@ -41,7 +41,12 @@ def main(argv: list[str]) -> int:
     results = []
     for it in spec.get("items", []):
         try:
-            if it.get("image_path"):
+            if it.get("multi"):
+                # One crop per visible person -> a LIST for this item.
+                info = crop_zoom.make_crops_multi(video, float(it["seconds"]), it["out_prefix"],
+                                                  max_w=max_w, min_w=min_w,
+                                                  max_persons=int(it.get("max_persons", 4)))
+            elif it.get("image_path"):
                 info = crop_zoom.second_chance_crop(video, float(it["seconds"]), it["image_path"],
                                                     Path(it["out_path"]), max_w=max_w, min_w=min_w)
             else:

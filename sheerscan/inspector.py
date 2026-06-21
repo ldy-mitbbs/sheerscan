@@ -292,6 +292,29 @@ def has_concrete_hosiery_evidence(reason: str) -> bool:
         return False
     return any(term.lower() in text for term in CONCRETE_HOSIERY_EVIDENCE_TERMS)
 
+_RECROP_LEG_FOOT_TERMS = ("脚", "腿", "足", "踝", "foot", "feet", "leg", "ankle", "toe")
+_RECROP_AMBIGUOUS_TERMS = (
+    "裸露", "裸腿", "裸足", "光脚", "赤脚", "光着脚", "肤色", "肉色", "自然",
+    "无明显", "无法确认", "无法看清", "无法判断", "看不清", "看不出", "难以",
+    "不确定", "质感自然", "光滑", "均匀", "bare", "natural skin", "cannot tell",
+    "uncertain", "unclear",
+)
+
+def is_ambiguous_legskin_reason(reason: str) -> bool:
+    """True when a coarse reason describes a visible leg/foot the model leaned
+    'bare skin / skin-coloured but no texture / can't tell' about — the single
+    hardest class (sheer skin-coloured hosiery vs bare legs). These are exactly
+    the candidates the semantic reason filter drops on an unreliable full-frame
+    call; a native-res leg crop is the proven lever (the leg region is usually
+    tiny/distant in the full frame). Excludes reasons that already cite concrete
+    hosiery evidence (nothing to rescue) — those are kept regardless."""
+    text = str(reason or "").strip().lower()
+    if not text or has_concrete_hosiery_evidence(text):
+        return False
+    if not any(t.lower() in text for t in _RECROP_LEG_FOOT_TERMS):
+        return False
+    return any(t.lower() in text for t in _RECROP_AMBIGUOUS_TERMS)
+
 def is_weak_hosiery_claim(reason: str) -> bool:
     text = str(reason or "").strip().lower()
     if not text:
@@ -2997,6 +3020,19 @@ class VideoInspector:
                         except Exception as e:
                             print(f"Second-chance pass skipped: {e}")
 
+                    # Re-crop pass: give the hardest class (skin-coloured hosiery
+                    # vs bare legs, where the leg region is tiny in the full
+                    # frame) a native-res second look before the semantic reason
+                    # filter judges it. Enrich-only; fail-open.
+                    if is_truthy_setting(get_setting("INSPECTOR_RECROP_AMBIGUOUS", "1")):
+                        try:
+                            self._recrop_ambiguous_candidates(
+                                coarse_detections, actual_video_path, job_dir,
+                                api_key, coarse_model_name, coarse_batch_size,
+                                progress_cb=progress_cb)
+                        except Exception as e:
+                            print(f"Re-crop pass skipped: {e}")
+
             if skip_fine_pass:
                 # Coarse-only mode: the (filtered) coarse candidates ARE the
                 # result. On the current ground truth this beats the fine-video
@@ -3382,6 +3418,121 @@ class VideoInspector:
         if progress_cb:
             progress_cb(54, f"Second-chance pass: recovered {len(extra)} candidate(s) from {len(crop_frames)} crop(s)")
         return extra
+
+    def _recrop_ambiguous_candidates(self, coarse_detections, video_path, job_dir,
+                                     api_key, model_name, batch_size, *, progress_cb=None):
+        """Re-examine coarse candidates the full frame judged 'bare skin / 肉色
+        but no texture / can't tell' (``is_ambiguous_legskin_reason``) — the
+        hardest class, where the leg region is usually too small/distant in the
+        full frame to resolve sheer hosiery. Pose-crop the leg region from the
+        native frame at the candidate's timestamp and re-ask the same model on
+        the zoom, then **replace** the candidate's reason (and review image)
+        with the crop answer so the downstream semantic reason filter judges on
+        the better view instead of the unreliable full-frame call.
+
+        Multi-person: a candidate frame often has several people; the area-ranked
+        single crop picks the most prominent one, which in the marked-scene class
+        is frequently the WRONG subject (a standing person in trousers in front of
+        a seated person whose legs are the actual target). So we crop EVERY
+        visible person's legs and re-ask on each, then rescue the candidate from
+        the strongest answer across them.
+
+        Enrich-only and fail-open: a crop can only turn a would-be-dropped
+        candidate into a kept one (or leave it unchanged when no crop yields a
+        hosiery signal, or the worker is down); it never deletes a candidate.
+        Bounded — runs on the coarse *candidate* set (small), not every frame.
+        Mutates the dicts in ``coarse_detections`` in place; returns the count
+        rescored."""
+        from . import crop_zoom
+
+        targets = [d for d in coarse_detections
+                   if d.get("seconds") is not None
+                   and is_ambiguous_legskin_reason(d.get("reason", ""))]
+        if not targets:
+            return 0
+        if progress_cb:
+            progress_cb(54, f"Re-crop pass: zooming {len(targets)} ambiguous leg/skin candidate(s)")
+
+        items, plan = [], []
+        for i, det in enumerate(targets):
+            prefix = str(Path(job_dir) / f"recrop_{i:03d}_{str(det.get('frame_id') or 'det').replace('/', '_')}")
+            items.append({"seconds": float(det["seconds"]), "multi": True, "out_prefix": prefix})
+            plan.append((det, i))
+        results = crop_zoom.make_crops_via_subprocess(video_path, items)
+        if results is None:
+            print("Re-crop pass skipped: pose worker unavailable")
+            return 0
+
+        # One crop_frame per (candidate, person); remember which candidate each
+        # belongs to so we can pick the best person-answer per candidate.
+        crop_frames = []
+        frame_meta = {}   # crop_id -> (target_index, out_path, box)
+        for (det, ti), infos in zip(plan, results):
+            for pj, info in enumerate(infos or []):
+                out = Path(info.get("out_path") or "")
+                if not out.exists():
+                    continue
+                cid = f"rc{ti}_p{pj}"
+                crop_frames.append({"id": cid, "file_path": str(out),
+                                    "timestamp_str": det.get("timestamp") or "00:00:00"})
+                frame_meta[cid] = (ti, out, info.get("box"))
+        if not crop_frames:
+            return 0
+
+        # Re-ask the model on every person crop.
+        answers = {}   # crop_id -> reason text
+        for i in range(0, len(crop_frames), batch_size):
+            batch = crop_frames[i:i + batch_size]
+            try:
+                dets = self.inspect_batch(
+                    batch, api_key, model_name, is_coarse=True, job_dir=job_dir,
+                    trace_name=f"recrop_{i // batch_size + 1:03d}",
+                    trace_stage="ambiguous_recrop")
+            except Exception as e:
+                print(f"Re-crop batch failed, skipped: {e}")
+                continue
+            for d in (dets or []):
+                if isinstance(d, dict) and str(d.get("reason") or "").strip():
+                    answers[d.get("frame_id")] = d["reason"]
+
+        def _signal(reason: str) -> int:
+            """Rank a person-crop answer; higher = stronger hosiery signal."""
+            r = str(reason or "").strip()
+            if not r:
+                return -1
+            if has_concrete_hosiery_evidence(r):
+                return 3
+            if is_false_positive_reason(r):
+                return 0          # crop confidently says bare -> not a rescue
+            if any(t in r for t in ("丝袜", "裤袜", "连裤袜", "pantyhose", "stocking", "hosiery")):
+                return 2
+            return 1              # uncertain / return-for-review
+
+        # For each candidate, rescue from its best-scoring person crop.
+        rescored = 0
+        for ti, (det, _) in enumerate(plan):
+            best_cid, best_sig = None, 0
+            for cid, (cti, _out, _box) in frame_meta.items():
+                if cti != ti or cid not in answers:
+                    continue
+                sig = _signal(answers[cid])
+                if sig > best_sig:
+                    best_cid, best_sig = cid, sig
+            # best_sig >= 1 means at least one person crop is uncertain-or-better;
+            # sig 0 (all crops say bare) leaves the original untouched (enrich-only).
+            if best_cid is None or best_sig < 1:
+                continue
+            _cti, out, box = frame_meta[best_cid]
+            det["reason"] = answers[best_cid]
+            det["recropped"] = True
+            det["image_file"] = out.name
+            det["crop_image_file"] = out.name
+            if box:
+                det["crop_box"] = box
+            rescored += 1
+        if progress_cb:
+            progress_cb(54, f"Re-crop pass: re-examined {rescored} candidate(s) at native resolution")
+        return rescored
 
     def _apply_crop_zoom(self, detections, video_path, job_dir, api_key, model_name, progress_cb=None):
         """For each kept detection, pose-localize the leg/foot and crop it from
