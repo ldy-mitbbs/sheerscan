@@ -1130,6 +1130,7 @@ def post_openrouter_with_retry(url, headers, payload, timeout, attempts=3):
     # (the identical payload reproduces clean), so treat it as transient here.
     retryable_status = {400, 429, 500, 502, 503, 504}
     for attempt in range(1, attempts + 1):
+        response = None
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
             try:
@@ -1137,6 +1138,14 @@ def post_openrouter_with_retry(url, headers, payload, timeout, attempts=3):
             except requests.exceptions.HTTPError as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 formatted = format_api_error(exc, provider_label)
+                # Free the failed response's socket NOW. The HTTPError keeps the
+                # Response (hence its underlying connection) reachable via its
+                # traceback, so refcounting won't reclaim it until the next
+                # generational GC. Under a long erroring run — e.g. a wrong/absent
+                # model id 400ing on every batch — those CLOSE_WAIT/CLOSED sockets
+                # pile up between GC sweeps and can exhaust the process fd limit
+                # (observed: the web server wedged on "Too many open files").
+                response.close()
                 # Quota exhaustion and provider content rejection are not
                 # transient — retrying just burns calls and backoff time.
                 deterministic = (
@@ -1144,7 +1153,7 @@ def post_openrouter_with_retry(url, headers, payload, timeout, attempts=3):
                     or is_skippable_provider_content_error(formatted)
                 )
                 if status in retryable_status and attempt < attempts and not deterministic:
-                    last_exc = exc
+                    last_exc = formatted
                     time.sleep(min(2 ** attempt, 8))
                     continue
                 raise RuntimeError(formatted) from exc
@@ -1152,11 +1161,15 @@ def post_openrouter_with_retry(url, headers, payload, timeout, attempts=3):
         except RuntimeError:
             raise
         except retryable as exc:
-            last_exc = exc
+            # Network error mid-request; close any partial response so its socket
+            # is released immediately rather than waiting on GC (see above).
+            if response is not None:
+                response.close()
+            last_exc = str(exc)
             if attempt == attempts:
                 break
             time.sleep(min(2 ** attempt, 8))
-    raise RuntimeError(f"{provider_label} request failed after {attempts} attempts: {last_exc}") from last_exc
+    raise RuntimeError(f"{provider_label} request failed after {attempts} attempts: {last_exc}")
 
 def is_skippable_provider_content_error(exc) -> bool:
     text = str(exc or "").lower()
