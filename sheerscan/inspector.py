@@ -2602,7 +2602,7 @@ class VideoInspector:
                     "content": content_list
                 }
             ],
-            "temperature": 0.1,
+            "temperature": get_float_setting("INSPECTOR_COARSE_TEMPERATURE", 0.1, min_value=0.0, max_value=2.0) if is_coarse else 0.1,
             "top_p": 0.9,
         }
         _rf = self._response_format()
@@ -2960,59 +2960,90 @@ class VideoInspector:
                     # per-batch, skip the failed one, and continue. Only abort if
                     # EVERY batch failed (a real config/key/model problem).
                     def _run_coarse_batch(item):
-                        b_idx, batch = item
+                        b_idx, batch, pass_idx = item
+                        # Keep pass-0 trace names byte-identical to the pre-ensemble
+                        # path; later passes get a distinct prefix so traces don't collide.
+                        tname = (f"coarse_batch_{b_idx + 1:03d}" if pass_idx == 0
+                                 else f"coarse_p{pass_idx + 1}_batch_{b_idx + 1:03d}")
                         try:
                             dets = self.inspect_batch(
                                 batch, api_key, coarse_model_name, is_coarse=True,
-                                job_dir=job_dir, trace_name=f"coarse_batch_{b_idx + 1:03d}", trace_stage="coarse_screenshot",
+                                job_dir=job_dir, trace_name=tname, trace_stage="coarse_screenshot",
                             )
                             return b_idx, batch, dets, None
                         except Exception as e:
                             return b_idx, batch, [], e
 
+                    # Multi-pass coarse ensemble (INSPECTOR_COARSE_ENSEMBLE_PASSES).
+                    # The coarse VLM is non-deterministic, so running it N times and
+                    # keeping frames that survive keep_coarse in >= MIN_VOTES passes
+                    # recovers ~half its single-pass misses at ~flat review cost
+                    # (measured 2026-06: recall 67%->80-88%, FP-per-TP flat ~1.3).
+                    # Recall is the only open axis — single-frame precision on the
+                    # hard 肉色丝袜-vs-bare class is at the signal ceiling. passes=1 +
+                    # min_votes=1 == the exact prior single-pass behavior.
+                    ens_passes = get_int_setting("INSPECTOR_COARSE_ENSEMBLE_PASSES", 1, min_value=1, max_value=9)
+                    ens_min_votes = min(get_int_setting("INSPECTOR_COARSE_ENSEMBLE_MIN_VOTES", 1, min_value=1, max_value=9), ens_passes)
+                    votes = {}  # frame_id -> {"count", "det", "frame", "rlen"}
                     coarse_failures = []
                     last_coarse_error = None
-                    with ThreadPoolExecutor(max_workers=coarse_concurrency) as _ex:
-                        for done, (b_idx, batch, detections, err) in enumerate(
-                            _ex.map(_run_coarse_batch, list(enumerate(coarse_batches))), start=1
-                        ):
-                            if err is not None:
-                                coarse_failures.append(b_idx)
-                                last_coarse_error = err
-                                print(f"Coarse batch {b_idx + 1}/{len(coarse_batches)} failed, skipped: {err}")
+                    passes_all_failed = 0
+                    for pass_idx in range(ens_passes):
+                        jobs = [(b_idx, batch, pass_idx) for b_idx, batch in enumerate(coarse_batches)]
+                        pass_failed = []
+                        with ThreadPoolExecutor(max_workers=coarse_concurrency) as _ex:
+                            for done, (b_idx, batch, detections, err) in enumerate(
+                                _ex.map(_run_coarse_batch, jobs), start=1
+                            ):
+                                if err is not None:
+                                    pass_failed.append(b_idx)
+                                    last_coarse_error = err
+                                    print(f"Coarse batch {b_idx + 1}/{len(coarse_batches)} (pass {pass_idx + 1}/{ens_passes}) failed, skipped: {err}")
+                                    continue
+                                for det in detections:
+                                    if not keep_coarse_detection(det, extreme_recall=extreme_recall, hybrid=True, is_two_pass=is_two_pass, exclude_male_subject=exclude_male, drop_weak_coarse=drop_weak_coarse):
+                                        continue
+                                    frame_id = det.get("frame_id")
+                                    matched_frame = next((f for f in batch if f["id"] == frame_id), None)
+                                    if not matched_frame:
+                                        continue
+                                    rlen = len(str(det.get("reason") or ""))
+                                    v = votes.get(frame_id)
+                                    if v is None:
+                                        votes[frame_id] = {"count": 1, "det": det, "frame": matched_frame, "rlen": rlen}
+                                    else:
+                                        v["count"] += 1
+                                        if rlen > v["rlen"]:  # keep the most detailed reason for the filter to judge
+                                            v["det"], v["frame"], v["rlen"] = det, matched_frame, rlen
                                 if progress_cb:
                                     progress_cb(
-                                        20 + int((done / len(coarse_batches)) * 30),
-                                        f"Coarse {coarse_model_name}: {done}/{len(coarse_batches)} done; {len(coarse_failures)} batch(es) skipped; {len(coarse_detections)} candidates"
+                                        20 + int(((pass_idx + done / len(coarse_batches)) / ens_passes) * 30),
+                                        f"Coarse {coarse_model_name} pass {pass_idx + 1}/{ens_passes}: {done}/{len(coarse_batches)} batches; {len(votes)} unique candidates"
                                     )
-                                continue
-                            kept_in_batch = 0
-                            for det in detections:
-                                if not keep_coarse_detection(det, extreme_recall=extreme_recall, hybrid=True, is_two_pass=is_two_pass, exclude_male_subject=exclude_male, drop_weak_coarse=drop_weak_coarse):
-                                    continue
-                                frame_id = det.get("frame_id")
-                                matched_frame = next((f for f in batch if f["id"] == frame_id), None)
-                                if matched_frame:
-                                    dest_name = f"{matched_frame['id']}_{matched_frame['timestamp_str'].replace(':', '_')}.jpg"
-                                    dest_path = job_dir / dest_name
-                                    shutil.copy2(matched_frame["file_path"], dest_path)
+                        coarse_failures.extend(pass_failed)
+                        if len(pass_failed) == len(coarse_batches):
+                            passes_all_failed += 1
 
-                                    det["image_file"] = dest_name
-                                    det["seconds"] = matched_frame["seconds"]
-                                    det["timestamp"] = matched_frame["timestamp_str"]
-                                    coarse_detections.append(det)
-                                    kept_in_batch += 1
-                            if progress_cb:
-                                progress_cb(
-                                    20 + int((done / len(coarse_batches)) * 30),
-                                    f"Coarse {coarse_model_name}: {done}/{len(coarse_batches)} batches done; {len(coarse_detections)} candidates so far"
-                                )
-
-                    if coarse_failures and len(coarse_failures) == len(coarse_batches):
-                        # Every batch failed -> not transient; surface the real error.
+                    if passes_all_failed == ens_passes and coarse_batches:
+                        # Every batch of every pass failed -> not transient; surface it.
                         raise RuntimeError(f"Error inspecting coarse frame batches: {last_coarse_error}") from last_coarse_error
                     if coarse_failures:
-                        print(f"Coarse pass: {len(coarse_failures)}/{len(coarse_batches)} batch(es) failed and were skipped (transient); continuing with {len(coarse_detections)} candidates")
+                        print(f"Coarse pass: {len(coarse_failures)} batch-run(s) failed across {ens_passes} pass(es) and were skipped (transient)")
+
+                    # Resolve votes -> kept coarse detections (copy each image once).
+                    for frame_id, v in votes.items():
+                        if v["count"] < ens_min_votes:
+                            continue
+                        det, matched_frame = v["det"], v["frame"]
+                        dest_name = f"{matched_frame['id']}_{matched_frame['timestamp_str'].replace(':', '_')}.jpg"
+                        shutil.copy2(matched_frame["file_path"], job_dir / dest_name)
+                        det["image_file"] = dest_name
+                        det["seconds"] = matched_frame["seconds"]
+                        det["timestamp"] = matched_frame["timestamp_str"]
+                        if ens_passes > 1:
+                            det["ensemble_votes"] = v["count"]
+                            det["ensemble_passes"] = ens_passes
+                        coarse_detections.append(det)
 
                     # Second-chance recall pass: the coarse model reliably misses
                     # scenes whose leg/foot region occupies a tiny part of the
