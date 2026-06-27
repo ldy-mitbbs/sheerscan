@@ -3696,10 +3696,13 @@ class VideoInspectorJobManager:
                             status_data["error_info"] = explain_inspector_error(status_data.get("error"))
                             needs_save = True
                         
-                        # Load results if completed
-                        if status_data.get("status") == "completed" and result_json.exists():
-                            status_data["result"] = json.loads(result_json.read_text(encoding="utf-8"))
-                            
+                        # Keep only the lightweight summary in memory (it's
+                        # already persisted in job_status.json: video_file +
+                        # detections_count/matches_count). The full result.json —
+                        # which carries the multi-MB inspection_trace and every
+                        # detection — is loaded on demand by get_job(). Eagerly
+                        # loading all of them here pinned hundreds of MB resident
+                        # and made the /api/inspect/jobs poll re-serialize it all.
                         self.jobs[status_data["job_id"]] = status_data
                         if needs_save:
                             self._save_job_status(status_data["job_id"])
@@ -3819,17 +3822,21 @@ class VideoInspectorJobManager:
             job = self.jobs.get(job_id)
             if not job:
                 return None
-                
-            # If the job is completed and we only saved the summary in the memory status, reload the full result
-            if job.get("status") == "completed" and (job.get("result") is None or "visual_detections" not in job["result"]):
+
+            # self.jobs holds only the lightweight summary. If a caller wants a
+            # completed job, hydrate the full result.json on demand — into a COPY,
+            # so the heavy payload (trace + detections) isn't pinned back into the
+            # in-memory cache and memory stays bounded as panels are opened.
+            if job.get("status") == "completed" and (job.get("result") is None or "visual_detections" not in (job.get("result") or {})):
                 result_json = get_local_video_dir() / "inspections" / job_id / "result.json"
                 if result_json.exists():
                     try:
-                        job["result"] = json.loads(result_json.read_text(encoding="utf-8"))
+                        job = {**job, "result": json.loads(result_json.read_text(encoding="utf-8"))}
                     except Exception as e:
                         print(f"Error loading full result for job {job_id}: {e}")
             if job.get("result") and job["result"].get("container_path"):
-                job["result"]["manual_marks"] = list_manual_marks(job["result"].get("container_path"))
+                job = {**job, "result": {**job["result"],
+                                         "manual_marks": list_manual_marks(job["result"].get("container_path"))}}
             return job
 
     def list_jobs(self):
