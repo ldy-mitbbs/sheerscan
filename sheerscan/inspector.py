@@ -1221,6 +1221,36 @@ class VideoInspector:
                     or os.environ.get("INSPECTOR_OPENAI_API_KEY") or "lm-studio")
         return get_secret("OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
 
+    def _preflight_coarse_backend(self) -> None:
+        """Fail fast if a LOCAL OpenAI/LM Studio coarse endpoint is unreachable.
+
+        A down or IP-changed GPU box otherwise *wedges* the job: every coarse
+        batch grinds through its full connect-timeout x retries (≈4.5 min each,
+        hundreds of batches → many hours) before the all-batches-failed abort
+        finally fires, and the auto-inspect poller — which treats any
+        queued/running job as "busy" — stops dispatching new work the whole
+        time. A 5 s health check up front turns that into a clean, immediate
+        failure so the queue moves on. Cloud providers are skipped: their
+        reachability is covered by per-batch retry/backoff, and we don't want a
+        flaky health check to block an otherwise-working cloud run."""
+        if self._api_provider() not in ("openai", "lmstudio"):
+            return
+        base = self._api_base_url().rstrip("/")
+        try:
+            resp = requests.get(f"{base}/models",
+                                headers={"Authorization": f"Bearer {self._api_key()}"},
+                                timeout=5)
+            ok = resp.status_code == 200
+            resp.close()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(
+                f"Coarse backend unreachable at {base} ({e}). Is the local GPU "
+                f"box up and LM Studio serving? Aborting before wasting work.") from e
+        if not ok:
+            raise RuntimeError(
+                f"Coarse backend health check at {base} returned HTTP "
+                f"{resp.status_code}; aborting.")
+
     def _normalize_model_name(self, model_name: str) -> str:
         model = str(model_name or "").strip()
         if self._api_provider() != "mulerouter":
@@ -2939,6 +2969,10 @@ class VideoInspector:
             )
         elif inspector_mode == "hybrid_video":
             coarse_detections = []
+            # Fail fast if a local coarse backend is down — before the minutes
+            # of frame extraction below, and before the per-batch timeout grind
+            # that would otherwise wedge the auto-inspect queue for hours.
+            self._preflight_coarse_backend()
             with tempfile.TemporaryDirectory(prefix="video-inspect-") as temp_dir:
                 coarse_frames = self.extract_frames(actual_video_path, temp_dir, coarse_interval)
                 coarse_frames, local_prefilter_stats = self.local_prefilter_frames(coarse_frames, progress_cb=progress_cb)
@@ -2988,6 +3022,13 @@ class VideoInspector:
                     coarse_failures = []
                     last_coarse_error = None
                     passes_all_failed = 0
+                    # Circuit breaker: if the backend dies mid-run (GPU box drops
+                    # off the network after extraction), don't grind the remaining
+                    # batches through full connect-timeouts for hours — bail once
+                    # failures streak past a threshold. Any success resets it, so a
+                    # scatter of transient 400s on a working run won't trip it.
+                    coarse_failfast = get_int_setting("INSPECTOR_COARSE_FAILFAST", 12, min_value=0, max_value=999)
+                    consecutive_fail = 0
                     for pass_idx in range(ens_passes):
                         jobs = [(b_idx, batch, pass_idx) for b_idx, batch in enumerate(coarse_batches)]
                         pass_failed = []
@@ -2998,8 +3039,14 @@ class VideoInspector:
                                 if err is not None:
                                     pass_failed.append(b_idx)
                                     last_coarse_error = err
+                                    consecutive_fail += 1
                                     print(f"Coarse batch {b_idx + 1}/{len(coarse_batches)} (pass {pass_idx + 1}/{ens_passes}) failed, skipped: {err}")
+                                    if coarse_failfast and consecutive_fail >= coarse_failfast:
+                                        raise RuntimeError(
+                                            f"Coarse backend appears down: {consecutive_fail} "
+                                            f"consecutive batch failures. Last error: {err}")
                                     continue
+                                consecutive_fail = 0
                                 for det in detections:
                                     if not keep_coarse_detection(det, extreme_recall=extreme_recall, hybrid=True, is_two_pass=is_two_pass, exclude_male_subject=exclude_male, drop_weak_coarse=drop_weak_coarse):
                                         continue
