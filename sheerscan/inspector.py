@@ -2981,7 +2981,11 @@ class VideoInspector:
                     if progress_cb:
                         progress_cb(20, f"Coarse pass: {coarse_model_name} will inspect {total_coarse} prefiltered frames in batches of {coarse_batch_size}")
                     coarse_batches = [coarse_frames[i:i + coarse_batch_size] for i in range(0, total_coarse, coarse_batch_size)]
-                    coarse_concurrency = get_int_setting("INSPECTOR_COARSE_CONCURRENCY", 6, min_value=1, max_value=16)
+                    # The cap exists to protect a local GPU backend (LM Studio)
+                    # from OOM under parallel passes; a cloud backend has no such
+                    # constraint, so give it much more headroom.
+                    coarse_concurrency_max = 16 if self._api_provider() in ("openai", "lmstudio") else 64
+                    coarse_concurrency = get_int_setting("INSPECTOR_COARSE_CONCURRENCY", 6, min_value=1, max_value=coarse_concurrency_max)
                     if progress_cb:
                         progress_cb(20, f"Coarse pass: {coarse_model_name} inspecting {total_coarse} frames in {len(coarse_batches)} batch(es), {coarse_concurrency}x parallel")
 
@@ -3715,8 +3719,12 @@ class VideoInspectorJobManager:
         self.lock = threading.Lock()
         # Serialize concurrent inspections (default 1). A slow local-GPU coarse
         # backend (LM Studio on a 16GB card) OOM-crashes if hit by parallel
-        # passes, so queued jobs run one at a time; raise for a cloud backend.
-        n = get_int_setting("INSPECTOR_MAX_CONCURRENT_JOBS", 1, min_value=1, max_value=8)
+        # passes, so queued jobs run one at a time; a cloud backend has no such
+        # constraint (the local work left per job — frame extraction, reason
+        # filter — is CPU/network-bound and just naturally contends for it,
+        # no software gate needed), so give it much more headroom.
+        jobs_max = 8 if self.inspector._api_provider() in ("openai", "lmstudio") else 64
+        n = get_int_setting("INSPECTOR_MAX_CONCURRENT_JOBS", 1, min_value=1, max_value=jobs_max)
         self._run_sem = threading.Semaphore(n)
         self._load_persisted_jobs()
 
