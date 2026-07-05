@@ -40,9 +40,15 @@ _HEDGE_SENTENCE = re.compile(
     r"(无法[^。；;!？?]{0,8}排除|不排除|不能排除"
     r"|可能(隐藏|穿着?|是|为)[^。；;!？?]{0,20}(丝袜|裤袜)"
     r"|保留[^。；;!？?]{0,10}(判断|复核|审核)"
-    r"|供后续[^。；;!？?]{0,6}(判断|复核)"
+    r"|[供需待][^。；;!？?]{0,4}后续[^。；;!？?]{0,6}(判断|复核|确认)"
+    r"|后续(步骤)?(判断|复核|确认)"
     r"|易漏判|需注意|需人工|建议人工)"
 )
+
+# "（如脱鞋后仍显皮肤光泽…）"-style hypothetical clauses quote the CRITERIA, not
+# the frame — drop them before hedge/observation checks so their 质感/光泽 words
+# can't shield the hedge sentence from stripping.
+_HYPOTHETICAL_CLAUSE = re.compile(r"[（(](?:如|例如|比如)[^）)]*[）)]|(?:例如|比如)[^。；;!？?，,]*")
 
 # A hedge sentence is only safe to drop when it carries no actual observation.
 # The coarse model often packs real evidence and the disclaimer into one long
@@ -56,10 +62,14 @@ _OBSERVATION_TERM = re.compile(
 def strip_hedge_sentences(text: str) -> str:
     """Drop pure-speculation disclaimer sentences, keeping actual observations."""
     parts = re.split(r"(?<=[。；;!！？?])", str(text or ""))
-    kept = [
-        p for p in parts
-        if p.strip() and not (_HEDGE_SENTENCE.search(p) and not _OBSERVATION_TERM.search(p))
-    ]
+    kept = []
+    for p in parts:
+        if not p.strip():
+            continue
+        gist = _HYPOTHETICAL_CLAUSE.sub("", p)
+        if _HEDGE_SENTENCE.search(gist) and not _OBSERVATION_TERM.search(gist):
+            continue
+        kept.append(p)
     return "".join(kept).strip()
 
 
